@@ -4,7 +4,7 @@ A VM folder organization plugin for HPE Morpheus VM Essentials / Enterprise / Co
 Organize, move, and manage VMs in a persistent folder tree.
 
 ![VM Folders Screenshot](docs/screenshot.png)
-
+![VM Folders Screenshot](docs/screenshot-dark.png)
 ---
 
 ## Features
