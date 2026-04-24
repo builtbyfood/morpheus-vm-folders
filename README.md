@@ -46,7 +46,7 @@ Organize, move, and manage VMs in a persistent folder tree.
 
 ## Quick Install (no build required)
 
-1. Download the latest jar from [Releases](https://github.com/YOUR_USERNAME/morpheus-vm-folders-plugin/releases/latest)
+1. Download the latest jar from [Releases](https://github.com/YOUR_USERNAME/morpheus-vm-folders-plugin/releases/)
 2. In Morpheus: **Admin → Integrations → Plugins → Upload**
 3. Select the jar file and click Upload
 4. Navigate to: `https://your-morpheus-url/plugin/vmFolders`
