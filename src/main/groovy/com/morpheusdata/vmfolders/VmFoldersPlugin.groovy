@@ -21,7 +21,7 @@ class VmFoldersPlugin extends Plugin {
         this.name        = 'VM Folders'
         this.description = 'VM Folder organization for HPE VM Essentials'
         this.author      = 'Travis DeLuca'
-        this.version     = '1.0.1'
+        this.version     = '1.0.0'
 
         VmFoldersNavProvider navProvider = new VmFoldersNavProvider(this, morpheus)
         registerProvider(navProvider)

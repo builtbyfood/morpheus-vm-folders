@@ -346,6 +346,45 @@ class VmFoldersController implements PluginController {
       --hpe-text: #333333; --hpe-muted: #767676; --hpe-white: #FFFFFF;
       --hpe-selected: #E6F5F1; --hpe-row-hover: #F9FAFA;
     }
+    body.dark {
+      --hpe-bg:         #1A1F2B;
+      --hpe-white:      #242B38;
+      --hpe-border:     #3A4458;
+      --hpe-text:       #E0E6F0;
+      --hpe-muted:      #8899B0;
+      --hpe-selected:   #1A3A30;
+      --hpe-row-hover:  #1E2535;
+      --hpe-header:     #2C3547;
+    }
+    /* Dark mode overrides for hardcoded backgrounds */
+    body.dark #vmf-tree,
+    body.dark #vmf-content,
+    body.dark #vmf-toolbar,
+    body.dark #vmf-tree-head,
+    body.dark table.vmft,
+    body.dark table.vmft thead th,
+    body.dark table.vmft tbody tr,
+    body.dark .vmf-mbox,
+    body.dark .vmf-mbody,
+    body.dark .vmf-mfoot,
+    body.dark .vmf-fg input,
+    body.dark .vmf-fg input:disabled { background: var(--hpe-white); color: var(--hpe-text); }
+    body.dark table.vmft tbody tr:hover { background: var(--hpe-row-hover); }
+    body.dark table.vmft tbody tr.sel  { background: var(--hpe-selected); }
+    body.dark #vmf-search { background: var(--hpe-white); color: var(--hpe-text); border-color: var(--hpe-border); }
+    body.dark .vmf-act   { background: var(--hpe-white); color: var(--hpe-text); border-color: var(--hpe-border); }
+    body.dark .vmf-act:hover { border-color: var(--hpe-green); color: var(--hpe-green); }
+    body.dark .vmf-fi    { color: var(--hpe-text); }
+    body.dark .vmf-fi:hover { background: var(--hpe-row-hover); }
+    body.dark .vmf-fi.active { background: var(--hpe-selected); color: var(--hpe-green); }
+    body.dark .vmf-fi-count  { background: #2E3A4E; color: var(--hpe-muted); }
+    body.dark .vmf-fi.active .vmf-fi-count { background: #1A3A30; color: var(--hpe-green); }
+    body.dark .vmft-name a  { color: var(--hpe-green); }
+    body.dark .vmf-tag  { background: #1A3A30; color: var(--hpe-green); border-color: #2A5A48; }
+    body.dark .vmf-btn-secondary { background: var(--hpe-white); color: var(--hpe-text); border-color: var(--hpe-border); }
+    body.dark .vmf-btn-secondary:hover { border-color: var(--hpe-green); color: var(--hpe-green); }
+    body.dark .vmf-mhead { background: #1A2030; }
+    body.dark #vmf-modal { background: rgba(0,0,0,.7); }
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 14px; background: var(--hpe-bg); color: var(--hpe-text); height: 100vh; overflow: hidden; display: flex; flex-direction: column; }
     #vmf-header { display: flex; align-items: center; justify-content: space-between; padding: 0 20px; height: 48px; background: var(--hpe-header); color: var(--hpe-white); flex-shrink: 0; box-shadow: 0 2px 4px rgba(0,0,0,.2); }
     #vmf-header h1 { font-size: 15px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
@@ -440,6 +479,7 @@ class VmFoldersController implements PluginController {
       <button class="vmf-btn vmf-btn-outline vmf-btn-sm" id="vmf-backup-btn" title="Backup database">&#128190; Backup</button>
       <button class="vmf-btn vmf-btn-outline vmf-btn-sm" id="vmf-restore-btn" title="Restore from backup">&#9100; Restore</button>
       <a class="vmf-btn vmf-btn-outline vmf-btn-sm" id="vmf-export-btn" href="/plugin/vmFolders/export" target="_blank" title="Export database">&#8595; Export</a>
+      <button class="vmf-btn vmf-btn-outline vmf-btn-sm" id="vmf-theme-btn" title="Toggle dark/light mode">&#9681;</button>
       <button class="vmf-btn vmf-btn-outline vmf-btn-sm" id="vmf-refresh-btn">&#8635; Refresh</button>
       <button class="vmf-btn vmf-btn-primary vmf-btn-sm" id="vmf-new-folder-btn">+ Folder</button>
     </div>
@@ -472,6 +512,17 @@ class VmFoldersController implements PluginController {
   <script nonce="${nonce}">
     document.addEventListener('DOMContentLoaded', function() {
       document.getElementById('vmf-search').addEventListener('input', function() { vmfFilter(this.value); });
+      // Theme toggle
+      (function() {
+        var theme = localStorage.getItem('vmf-theme') || 'light';
+        if (theme === 'dark') document.body.classList.add('dark');
+        document.getElementById('vmf-theme-btn').textContent = theme === 'dark' ? '\u2600' : '\u263D';
+      })();
+      document.getElementById('vmf-theme-btn').addEventListener('click', function() {
+        var isDark = document.body.classList.toggle('dark');
+        localStorage.setItem('vmf-theme', isDark ? 'dark' : 'light');
+        this.textContent = isDark ? '\u2600' : '\u263D';
+      });
       document.getElementById('vmf-refresh-btn').addEventListener('click', function() { vmfReload(); });
       document.getElementById('vmf-new-folder-btn').addEventListener('click', function() { vmfCreateFolder(); });
       document.getElementById('vmf-mv-btn').addEventListener('click', function() { vmfMoveSelected(); });
