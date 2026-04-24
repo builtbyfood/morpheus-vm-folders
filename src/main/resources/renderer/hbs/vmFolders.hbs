@@ -1,0 +1,990 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VM Folders</title>
+  <style>
+    /* ─── Reset / Base ─────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 13px;
+      background: #f4f5f7;
+      color: #2c3e50;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* ─── Layout ────────────────────────────────────────────────────── */
+    #vmf-app {
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+      background: #f4f5f7;
+    }
+
+    #vmf-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 16px;
+      background: #1e2d3d;
+      color: #fff;
+      flex-shrink: 0;
+      box-shadow: 0 2px 4px rgba(0,0,0,.25);
+    }
+    #vmf-header h1 {
+      font-size: 15px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    #vmf-main {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    /* ─── Folder Tree Panel ─────────────────────────────────────────── */
+    #vmf-tree {
+      width: 240px;
+      min-width: 180px;
+      max-width: 320px;
+      background: #ffffff;
+      border-right: 1px solid #dee2e6;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      flex-shrink: 0;
+      resize: horizontal;
+    }
+
+    #vmf-tree-header {
+      padding: 10px 12px;
+      font-weight: 600;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      color: #6c757d;
+      background: #f8f9fa;
+      border-bottom: 1px solid #dee2e6;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    #vmf-folder-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 4px 0;
+    }
+
+    .vmf-folder-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 7px 10px;
+      cursor: pointer;
+      border-left: 3px solid transparent;
+      transition: background .12s, border-color .12s;
+      user-select: none;
+    }
+    .vmf-folder-item:hover { background: #f0f4ff; }
+    .vmf-folder-item.active {
+      background: #e8f0fe;
+      border-left-color: #4169e1;
+      color: #2851c9;
+      font-weight: 600;
+    }
+    .vmf-folder-item .folder-icon { font-size: 14px; }
+    .vmf-folder-item .folder-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .vmf-folder-item .folder-count {
+      font-size: 10px;
+      background: #dee2e6;
+      color: #6c757d;
+      border-radius: 8px;
+      padding: 1px 6px;
+      flex-shrink: 0;
+    }
+    .vmf-folder-item.active .folder-count { background: #c2d3fb; color: #2851c9; }
+
+    .vmf-folder-indent { padding-left: 26px; }
+    .vmf-folder-indent2 { padding-left: 42px; }
+
+    /* ─── VM Grid Panel ─────────────────────────────────────────────── */
+    #vmf-content {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    #vmf-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      background: #fff;
+      border-bottom: 1px solid #dee2e6;
+      flex-shrink: 0;
+    }
+
+    #vmf-search {
+      flex: 1;
+      max-width: 280px;
+      padding: 5px 10px;
+      border: 1px solid #ced4da;
+      border-radius: 4px;
+      font-size: 12px;
+    }
+    #vmf-search:focus { outline: none; border-color: #4169e1; box-shadow: 0 0 0 2px rgba(65,105,225,.15); }
+
+    .vmf-breadcrumb {
+      font-size: 12px;
+      color: #6c757d;
+      padding: 0 4px;
+    }
+    .vmf-breadcrumb span { color: #4169e1; font-weight: 500; }
+
+    .vmf-btn {
+      padding: 5px 12px;
+      border: 1px solid #ced4da;
+      border-radius: 4px;
+      background: #fff;
+      cursor: pointer;
+      font-size: 12px;
+      color: #2c3e50;
+      transition: background .12s;
+      white-space: nowrap;
+    }
+    .vmf-btn:hover { background: #f0f4ff; border-color: #4169e1; color: #2851c9; }
+    .vmf-btn-primary {
+      background: #4169e1;
+      border-color: #2851c9;
+      color: #fff;
+    }
+    .vmf-btn-primary:hover { background: #2851c9; }
+    .vmf-btn-danger { border-color: #dc3545; color: #dc3545; }
+    .vmf-btn-danger:hover { background: #fff1f2; }
+
+    #vmf-vm-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 0;
+    }
+
+    /* ─── VM Table ──────────────────────────────────────────────────── */
+    table.vmf-table {
+      width: 100%;
+      border-collapse: collapse;
+      background: #fff;
+    }
+    table.vmf-table thead th {
+      position: sticky;
+      top: 0;
+      background: #f8f9fa;
+      border-bottom: 1px solid #dee2e6;
+      padding: 8px 12px;
+      text-align: left;
+      font-weight: 600;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+      color: #6c757d;
+      white-space: nowrap;
+      cursor: pointer;
+      user-select: none;
+    }
+    table.vmf-table thead th:hover { color: #2c3e50; }
+    table.vmf-table thead th.sorted { color: #4169e1; }
+
+    table.vmf-table tbody tr {
+      border-bottom: 1px solid #f0f0f0;
+      transition: background .08s;
+    }
+    table.vmf-table tbody tr:hover { background: #f8f9fa; }
+    table.vmf-table tbody tr.selected { background: #e8f0fe; }
+
+    table.vmf-table td {
+      padding: 8px 12px;
+      vertical-align: middle;
+      font-size: 12px;
+    }
+
+    .vmf-status-dot {
+      display: inline-block;
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      margin-right: 5px;
+    }
+    .vmf-status-running  { background: #28a745; }
+    .vmf-status-stopped  { background: #dc3545; }
+    .vmf-status-unknown  { background: #adb5bd; }
+    .vmf-status-pending  { background: #fd7e14; }
+
+    .vmf-vm-name { font-weight: 500; color: #1a237e; }
+    .vmf-vm-name a { color: inherit; text-decoration: none; }
+    .vmf-vm-name a:hover { text-decoration: underline; }
+
+    .vmf-tag {
+      display: inline-block;
+      background: #e9ecef;
+      color: #495057;
+      border-radius: 3px;
+      padding: 1px 6px;
+      font-size: 10px;
+      margin: 1px;
+    }
+    .vmf-tag-folder { background: #dbe4ff; color: #2851c9; }
+
+    .vmf-actions { display: flex; gap: 4px; }
+    .vmf-action-btn {
+      padding: 3px 8px;
+      font-size: 11px;
+      border: 1px solid #ced4da;
+      border-radius: 3px;
+      background: #fff;
+      cursor: pointer;
+      color: #495057;
+      transition: background .1s;
+    }
+    .vmf-action-btn:hover { background: #f0f4ff; border-color: #4169e1; color: #2851c9; }
+
+    /* ─── Status Bar ─────────────────────────────────────────────────── */
+    #vmf-statusbar {
+      padding: 5px 14px;
+      background: #f8f9fa;
+      border-top: 1px solid #dee2e6;
+      font-size: 11px;
+      color: #6c757d;
+      flex-shrink: 0;
+    }
+
+    /* ─── Modal ──────────────────────────────────────────────────────── */
+    .vmf-modal-overlay {
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,.45);
+      display: flex; align-items: center; justify-content: center;
+      z-index: 9999;
+    }
+    .vmf-modal {
+      background: #fff;
+      border-radius: 6px;
+      box-shadow: 0 8px 32px rgba(0,0,0,.2);
+      min-width: 380px;
+      max-width: 480px;
+      width: 90vw;
+      overflow: hidden;
+    }
+    .vmf-modal-header {
+      padding: 14px 16px;
+      background: #1e2d3d;
+      color: #fff;
+      font-weight: 600;
+      font-size: 14px;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .vmf-modal-header .vmf-close {
+      cursor: pointer; font-size: 18px; line-height: 1; opacity: .7;
+    }
+    .vmf-modal-header .vmf-close:hover { opacity: 1; }
+    .vmf-modal-body { padding: 16px; }
+    .vmf-modal-footer { padding: 10px 16px; border-top: 1px solid #dee2e6; display: flex; gap: 8px; justify-content: flex-end; }
+
+    .vmf-form-group { margin-bottom: 12px; }
+    .vmf-form-group label { display: block; font-size: 12px; font-weight: 600; margin-bottom: 4px; color: #495057; }
+    .vmf-form-group input, .vmf-form-group select {
+      width: 100%;
+      padding: 6px 10px;
+      border: 1px solid #ced4da;
+      border-radius: 4px;
+      font-size: 13px;
+    }
+    .vmf-form-group input:focus, .vmf-form-group select:focus {
+      outline: none; border-color: #4169e1; box-shadow: 0 0 0 2px rgba(65,105,225,.15);
+    }
+
+    /* ─── Loading / Empty States ─────────────────────────────────────── */
+    .vmf-loading {
+      display: flex; align-items: center; justify-content: center;
+      padding: 48px; color: #6c757d; gap: 10px; font-size: 13px;
+    }
+    .vmf-spinner {
+      width: 20px; height: 20px;
+      border: 2px solid #dee2e6;
+      border-top-color: #4169e1;
+      border-radius: 50%;
+      animation: spin .7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .vmf-empty {
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      padding: 48px; color: #6c757d; gap: 8px;
+    }
+    .vmf-empty-icon { font-size: 36px; }
+
+    .vmf-error-banner {
+      background: #fff5f5; border: 1px solid #fc8181; color: #c53030;
+      padding: 10px 14px; margin: 8px; border-radius: 4px; font-size: 12px;
+    }
+
+    /* ─── Toast ──────────────────────────────────────────────────────── */
+    #vmf-toast {
+      position: fixed; bottom: 24px; right: 24px;
+      background: #1e2d3d; color: #fff;
+      padding: 10px 18px; border-radius: 5px;
+      font-size: 12px; box-shadow: 0 4px 12px rgba(0,0,0,.2);
+      opacity: 0; transition: opacity .25s;
+      pointer-events: none; z-index: 10000;
+    }
+    #vmf-toast.show { opacity: 1; }
+    #vmf-toast.error { background: #dc3545; }
+  </style>
+</head>
+<body>
+
+<div id="vmf-app">
+
+  <!-- Header -->
+  <div id="vmf-header">
+    <h1>&#128193; VM Folders</h1>
+    <div style="display:flex;gap:8px;align-items:center;">
+      <button class="vmf-btn" onclick="vmf.createFolder()" title="New folder">+ New Folder</button>
+      <button class="vmf-btn" onclick="vmf.reload()" title="Refresh VM list">&#8635; Refresh</button>
+    </div>
+  </div>
+
+  <div id="vmf-main">
+
+    <!-- Left: Folder Tree -->
+    <div id="vmf-tree">
+      <div id="vmf-tree-header">
+        <span>Folders</span>
+        <span id="vmf-folder-count" style="font-size:10px;font-weight:400;"></span>
+      </div>
+      <div id="vmf-folder-list">
+        <div class="vmf-loading"><div class="vmf-spinner"></div> Loading...</div>
+      </div>
+    </div>
+
+    <!-- Right: VM List -->
+    <div id="vmf-content">
+      <div id="vmf-toolbar">
+        <input id="vmf-search" type="text" placeholder="Search VMs..." oninput="vmf.filterVms(this.value)">
+        <div class="vmf-breadcrumb" id="vmf-breadcrumb">&#128193; <span>All VMs</span></div>
+        <button class="vmf-btn" id="vmf-move-selected" onclick="vmf.moveSelected()" style="display:none;">Move Selected</button>
+        <button class="vmf-btn vmf-btn-danger" id="vmf-remove-selected" onclick="vmf.removeFromFolder()" style="display:none;">Remove from Folder</button>
+      </div>
+      <div id="vmf-vm-list">
+        <div class="vmf-loading"><div class="vmf-spinner"></div> Loading VMs...</div>
+      </div>
+      <div id="vmf-statusbar">Ready</div>
+    </div>
+
+  </div>
+</div>
+
+<!-- Modal -->
+<div id="vmf-modal" class="vmf-modal-overlay" style="display:none;">
+  <div class="vmf-modal">
+    <div class="vmf-modal-header">
+      <span id="vmf-modal-title">Modal</span>
+      <span class="vmf-close" onclick="vmf.closeModal()">&#215;</span>
+    </div>
+    <div class="vmf-modal-body" id="vmf-modal-body"></div>
+    <div class="vmf-modal-footer" id="vmf-modal-footer"></div>
+  </div>
+</div>
+
+<!-- Toast -->
+<div id="vmf-toast"></div>
+
+<script nonce="{{nonce}}">
+/**
+ * VM Folders — Client-Side SPA
+ *
+ * All data operations go through the Morpheus REST API using the browser's
+ * existing session cookie (same-origin requests, no token needed).
+ *
+ * Folder membership is stored as a VM metadata tag: vm-folder = /Path/To/Folder
+ * API: GET/POST /api/servers/{id}/metadata
+ *
+ * The Morpheus API paginates at max=250 — we page through all results.
+ *
+ * Tested against Morpheus API v5.x / v6.x / v7.x
+ */
+const vmf = (() => {
+
+  // ─── State ──────────────────────────────────────────────────────────
+  let allVms       = [];        // all fetched VMs
+  let folders      = {};        // { '/path': [vm, ...] }
+  let activeFolder = '__all__'; // currently selected folder key
+  let searchQuery  = '';
+  let selectedIds  = new Set();
+  let sortCol      = 'name';
+  let sortAsc      = true;
+
+  const FOLDER_META_KEY = 'vm-folder';
+  const ROOT_FOLDER     = '/';
+
+  // ─── Bootstrap ──────────────────────────────────────────────────────
+  async function init() {
+    await reload();
+  }
+
+  async function reload() {
+    setStatus('Loading VMs from Morpheus API…');
+    renderFolderList('<div class="vmf-loading"><div class="vmf-spinner"></div> Loading folders…</div>');
+    renderVmList('<div class="vmf-loading"><div class="vmf-spinner"></div> Loading VMs…</div>');
+    selectedIds.clear();
+    updateSelectionButtons();
+
+    try {
+      allVms = await fetchAllVms();
+      buildFolderMap();
+      renderFolderTree();
+      renderCurrentVms();
+      setStatus(`Loaded ${allVms.length} VMs across ${Object.keys(folders).length} folders`);
+    } catch(e) {
+      const msg = `Failed to load VMs: ${e.message}`;
+      renderVmList(`<div class="vmf-error-banner">&#9888; ${msg}<br>Check that you are logged into Morpheus and have server access.</div>`);
+      setStatus(msg);
+      console.error('[vmf]', e);
+    }
+  }
+
+  // ─── API Helpers ────────────────────────────────────────────────────
+
+  /**
+   * Fetch ALL compute servers (VMs only, not hypervisor hosts).
+   * Morpheus paginates — we walk pages of 250 until done.
+   */
+  async function fetchAllVms() {
+    let vms    = [];
+    let offset = 0;
+    const max  = 250;
+
+    while (true) {
+      const url = `/api/servers?max=${max}&offset=${offset}&vmHypervisor=false&serverType=vm`;
+      const data = await apiFetch(url);
+      const page = (data.servers || data.computeServers || []);
+      vms = vms.concat(page);
+      if (vms.length >= (data.meta?.total || vms.length) || page.length < max) break;
+      offset += max;
+    }
+
+    return vms;
+  }
+
+  async function apiFetch(url, opts = {}) {
+    const res = await fetch(url, {
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      ...opts
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`API ${opts.method || 'GET'} ${url} → ${res.status}: ${text.substring(0,200)}`);
+    }
+    return res.json();
+  }
+
+  /** Read folder path from VM metadata */
+  function getFolderPath(vm) {
+    const meta = vm.metadata || vm.serverMetadata || [];
+    const tag  = meta.find(m => m.name === FOLDER_META_KEY);
+    return tag ? (tag.value || ROOT_FOLDER) : ROOT_FOLDER;
+  }
+
+  /** Set folder path via Morpheus metadata API */
+  async function setFolderPath(vmId, path) {
+    // Morpheus metadata upsert — POST creates or updates a named key
+    await apiFetch(`/api/servers/${vmId}/metadata`, {
+      method: 'POST',
+      body: JSON.stringify({ metadata: [{ name: FOLDER_META_KEY, value: path }] })
+    });
+  }
+
+  /** Remove folder metadata from a VM */
+  async function removeFolderPath(vmId) {
+    // Fetch existing metadata first to find the id
+    const data = await apiFetch(`/api/servers/${vmId}/metadata`);
+    const meta  = data.metadata || [];
+    const tag   = meta.find(m => m.name === FOLDER_META_KEY);
+    if (tag && tag.id) {
+      await apiFetch(`/api/servers/${vmId}/metadata/${tag.id}`, { method: 'DELETE' });
+    }
+  }
+
+  // ─── Folder Map ─────────────────────────────────────────────────────
+
+  function buildFolderMap() {
+    folders = {};
+    allVms.forEach(vm => {
+      const path = getFolderPath(vm);
+      if (!folders[path]) folders[path] = [];
+      folders[path].push(vm);
+    });
+  }
+
+  /** All unique folder paths, sorted, with parent paths auto-created */
+  function getAllFolderPaths() {
+    const paths = new Set(Object.keys(folders));
+    // Ensure parent paths exist in the tree even if empty
+    [...paths].forEach(p => {
+      const parts = p.split('/').filter(Boolean);
+      for (let i = 1; i < parts.length; i++) {
+        paths.add('/' + parts.slice(0, i).join('/'));
+      }
+    });
+    return [...paths].sort();
+  }
+
+  function folderVmCount(path) {
+    // Count VMs in this folder AND all descendants
+    return allVms.filter(vm => {
+      const p = getFolderPath(vm);
+      return p === path || p.startsWith(path + '/');
+    }).length;
+  }
+
+  // ─── Render: Folder Tree ─────────────────────────────────────────────
+
+  function renderFolderTree() {
+    const paths = getAllFolderPaths();
+    document.getElementById('vmf-folder-count').textContent = `${paths.length} folders`;
+
+    let html = '';
+
+    // "All VMs" pseudo-folder
+    const allActive = activeFolder === '__all__';
+    html += `<div class="vmf-folder-item${allActive ? ' active' : ''}" onclick="vmf.selectFolder('__all__')">
+      <span class="folder-icon">&#128196;</span>
+      <span class="folder-name">All VMs</span>
+      <span class="folder-count">${allVms.length}</span>
+    </div>`;
+
+    // Root separator
+    html += `<div style="height:1px;background:#f0f0f0;margin:4px 0;"></div>`;
+
+    // Walk folders
+    if (paths.length === 0 || (paths.length === 1 && paths[0] === ROOT_FOLDER)) {
+      html += `<div style="padding:12px;color:#aaa;font-size:11px;text-align:center;">No folders yet.<br>Select VMs and click Move to assign them.</div>`;
+    } else {
+      paths.forEach(path => {
+        const depth  = path.split('/').filter(Boolean).length;
+        const name   = path.split('/').filter(Boolean).pop() || '/';
+        const count  = folderVmCount(path);
+        const indent = depth > 1 ? (depth === 2 ? ' vmf-folder-indent' : ' vmf-folder-indent2') : '';
+        const active = activeFolder === path ? ' active' : '';
+        const icon   = '&#128193;';
+
+        html += `<div class="vmf-folder-item${indent}${active}" onclick="vmf.selectFolder('${escHtml(path)}')"
+          ondragover="event.preventDefault()" ondrop="vmf.onDropFolder(event,'${escHtml(path)}')">
+          <span class="folder-icon">${icon}</span>
+          <span class="folder-name" title="${escHtml(path)}">${escHtml(name)}</span>
+          <span class="folder-count">${count}</span>
+        </div>`;
+      });
+    }
+
+    // Unorganized (no folder tag / root)
+    if (folders[ROOT_FOLDER] && folders[ROOT_FOLDER].length > 0) {
+      const uActive = activeFolder === ROOT_FOLDER ? ' active' : '';
+      html += `<div style="height:1px;background:#f0f0f0;margin:4px 0;"></div>`;
+      html += `<div class="vmf-folder-item${uActive}" onclick="vmf.selectFolder('/')">
+        <span class="folder-icon">&#128220;</span>
+        <span class="folder-name">Unorganized</span>
+        <span class="folder-count">${folders[ROOT_FOLDER].length}</span>
+      </div>`;
+    }
+
+    renderFolderList(html);
+  }
+
+  function renderFolderList(html) {
+    document.getElementById('vmf-folder-list').innerHTML = html;
+  }
+
+  // ─── Render: VM Table ─────────────────────────────────────────────────
+
+  function selectFolder(key) {
+    activeFolder = key;
+    selectedIds.clear();
+    updateSelectionButtons();
+    renderFolderTree();
+    renderCurrentVms();
+    // Update breadcrumb
+    const label = key === '__all__' ? 'All VMs' : (key === ROOT_FOLDER ? 'Unorganized' : key);
+    document.getElementById('vmf-breadcrumb').innerHTML = `&#128193; <span>${escHtml(label)}</span>`;
+  }
+
+  function getFilteredVms() {
+    let vms;
+    if (activeFolder === '__all__') {
+      vms = [...allVms];
+    } else if (activeFolder === ROOT_FOLDER) {
+      vms = folders[ROOT_FOLDER] || [];
+    } else {
+      // Include this folder and all descendants
+      vms = allVms.filter(vm => {
+        const p = getFolderPath(vm);
+        return p === activeFolder || p.startsWith(activeFolder + '/');
+      });
+    }
+
+    if (searchQuery) {
+      const q = searchQuery.toLowerCase();
+      vms = vms.filter(vm =>
+        (vm.name || '').toLowerCase().includes(q) ||
+        (vm.displayName || '').toLowerCase().includes(q) ||
+        (vm.externalIp || '').includes(q) ||
+        (vm.internalIp || '').includes(q)
+      );
+    }
+
+    // Sort
+    vms = [...vms].sort((a, b) => {
+      let av = (a[sortCol] || '').toString().toLowerCase();
+      let bv = (b[sortCol] || '').toString().toLowerCase();
+      if (sortCol === 'powerState') { av = statusRank(a); bv = statusRank(b); }
+      const cmp = av < bv ? -1 : av > bv ? 1 : 0;
+      return sortAsc ? cmp : -cmp;
+    });
+
+    return vms;
+  }
+
+  function renderCurrentVms() {
+    const vms = getFilteredVms();
+
+    if (vms.length === 0) {
+      renderVmList(`
+        <div class="vmf-empty">
+          <div class="vmf-empty-icon">&#128193;</div>
+          <div>${searchQuery ? 'No VMs match your search.' : 'This folder is empty.'}</div>
+          ${!searchQuery ? '<div style="font-size:11px;color:#adb5bd;">Select VMs from All VMs and use Move to add them here.</div>' : ''}
+        </div>`);
+      setStatus('0 VMs in view');
+      return;
+    }
+
+    const sortArrow = (col) => sortCol === col ? (sortAsc ? ' ▲' : ' ▼') : '';
+
+    let html = `<table class="vmf-table">
+      <thead>
+        <tr>
+          <th style="width:32px;"><input type="checkbox" id="vmf-check-all" onchange="vmf.toggleAll(this.checked)" title="Select all"></th>
+          <th class="${sortCol==='name'?'sorted':''}" onclick="vmf.sort('name')">Name${sortArrow('name')}</th>
+          <th class="${sortCol==='powerState'?'sorted':''}" onclick="vmf.sort('powerState')">Status${sortArrow('powerState')}</th>
+          <th>IP Address</th>
+          <th>Host</th>
+          <th>OS</th>
+          <th>Folder</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>`;
+
+    vms.forEach(vm => {
+      const id       = vm.id;
+      const name     = vm.name || vm.displayName || `VM-${id}`;
+      const status   = vm.powerState || vm.status || 'unknown';
+      const ip       = vm.externalIp || vm.internalIp || '—';
+      const host     = vm.computeServerType?.name || vm.serverOs?.name || '—';
+      const os       = vm.osType?.name || vm.serverOs?.name || '—';
+      const folder   = getFolderPath(vm);
+      const sel      = selectedIds.has(id);
+      const dotClass = statusDotClass(status);
+
+      html += `<tr class="${sel ? 'selected' : ''}" draggable="true"
+        ondragstart="vmf.onDragStart(event,${id})"
+        ondragover="event.preventDefault()"
+        ondrop="vmf.onDropRow(event,${id})">
+        <td><input type="checkbox" ${sel?'checked':''} onchange="vmf.toggleSelect(${id},this.checked)"></td>
+        <td class="vmf-vm-name">
+          <a href="/infrastructure/servers/${id}" target="_blank" title="Open in Morpheus">${escHtml(name)}</a>
+        </td>
+        <td><span class="vmf-status-dot ${dotClass}"></span>${escHtml(status)}</td>
+        <td>${escHtml(ip)}</td>
+        <td>${escHtml(host)}</td>
+        <td>${escHtml(os)}</td>
+        <td>${folder === ROOT_FOLDER
+          ? '<span style="color:#adb5bd;font-size:11px;">Unorganized</span>'
+          : `<span class="vmf-tag vmf-tag-folder" title="${escHtml(folder)}">${escHtml(folderBasename(folder))}</span>`}
+        </td>
+        <td>
+          <div class="vmf-actions">
+            <button class="vmf-action-btn" onclick="vmf.moveSingleVm(${id})">Move</button>
+            ${folder !== ROOT_FOLDER
+              ? `<button class="vmf-action-btn" onclick="vmf.removeSingleVm(${id})" title="Remove from folder">&#10006;</button>`
+              : ''}
+          </div>
+        </td>
+      </tr>`;
+    });
+
+    html += '</tbody></table>';
+    renderVmList(html);
+    setStatus(`${vms.length} VM${vms.length!==1?'s':''} in view${searchQuery?' (filtered)':''}`);
+  }
+
+  function renderVmList(html) {
+    document.getElementById('vmf-vm-list').innerHTML = html;
+  }
+
+  // ─── Selection ────────────────────────────────────────────────────────
+
+  function toggleSelect(id, checked) {
+    if (checked) selectedIds.add(id); else selectedIds.delete(id);
+    updateSelectionButtons();
+    renderCurrentVms(); // re-render to update row highlight
+  }
+
+  function toggleAll(checked) {
+    const vms = getFilteredVms();
+    if (checked) vms.forEach(vm => selectedIds.add(vm.id));
+    else selectedIds.clear();
+    updateSelectionButtons();
+    renderCurrentVms();
+  }
+
+  function updateSelectionButtons() {
+    const n = selectedIds.size;
+    const movBtn = document.getElementById('vmf-move-selected');
+    const remBtn = document.getElementById('vmf-remove-selected');
+    if (movBtn) movBtn.style.display = n > 0 ? '' : 'none';
+    if (remBtn) remBtn.style.display = n > 0 && activeFolder !== '__all__' && activeFolder !== ROOT_FOLDER ? '' : 'none';
+  }
+
+  // ─── Sort / Filter ────────────────────────────────────────────────────
+
+  function sort(col) {
+    if (sortCol === col) sortAsc = !sortAsc;
+    else { sortCol = col; sortAsc = true; }
+    renderCurrentVms();
+  }
+
+  function filterVms(q) {
+    searchQuery = q;
+    renderCurrentVms();
+  }
+
+  // ─── Move VMs ────────────────────────────────────────────────────────
+
+  function moveSingleVm(id) {
+    selectedIds.clear();
+    selectedIds.add(id);
+    moveSelected();
+  }
+
+  function moveSelected() {
+    if (selectedIds.size === 0) return;
+    const folderPaths = getAllFolderPaths().filter(p => p !== ROOT_FOLDER);
+    const optionsHtml = folderPaths.map(p =>
+      `<option value="${escHtml(p)}">${escHtml(p)}</option>`
+    ).join('');
+
+    openModal('Move to Folder',
+      `<div class="vmf-form-group">
+        <label>Select or type a folder path</label>
+        <input id="vmf-modal-folder-input" list="vmf-folder-datalist" placeholder="/Production/Web"
+          value="${escHtml(activeFolder !== '__all__' && activeFolder !== ROOT_FOLDER ? activeFolder : '')}">
+        <datalist id="vmf-folder-datalist">${optionsHtml}</datalist>
+        <div style="font-size:11px;color:#6c757d;margin-top:6px;">
+          Use / to create nested folders, e.g. /Production/Web<br>
+          Moving ${selectedIds.size} VM${selectedIds.size!==1?'s':''}.
+        </div>
+      </div>`,
+      [
+        { label: 'Cancel', cls: '', fn: 'vmf.closeModal()' },
+        { label: 'Move', cls: 'vmf-btn-primary', fn: 'vmf.confirmMove()' }
+      ]
+    );
+    setTimeout(() => document.getElementById('vmf-modal-folder-input')?.focus(), 50);
+  }
+
+  async function confirmMove() {
+    const input = document.getElementById('vmf-modal-folder-input');
+    if (!input) return;
+    let path = (input.value || '').trim();
+    if (!path) { showToast('Enter a folder path', true); return; }
+    if (!path.startsWith('/')) path = '/' + path;
+    closeModal();
+    await applyFolderMove([...selectedIds], path);
+  }
+
+  async function removeSingleVm(id) {
+    if (!confirm('Remove this VM from its folder?')) return;
+    await applyFolderMove([id], ROOT_FOLDER);
+  }
+
+  async function removeFromFolder() {
+    if (selectedIds.size === 0) return;
+    if (!confirm(`Remove ${selectedIds.size} VM${selectedIds.size!==1?'s':''} from folder?`)) return;
+    await applyFolderMove([...selectedIds], ROOT_FOLDER);
+  }
+
+  async function applyFolderMove(ids, path) {
+    setStatus(`Moving ${ids.length} VM${ids.length!==1?'s':''}…`);
+    let ok = 0, fail = 0;
+    for (const id of ids) {
+      try {
+        if (path === ROOT_FOLDER) {
+          await removeFolderPath(id);
+        } else {
+          await setFolderPath(id, path);
+        }
+        ok++;
+      } catch(e) {
+        fail++;
+        console.error('[vmf] move error', id, e);
+      }
+    }
+    selectedIds.clear();
+    if (fail > 0) showToast(`${ok} moved, ${fail} failed — check console`, true);
+    else showToast(`Moved ${ok} VM${ok!==1?'s':''} to ${path === ROOT_FOLDER ? 'Unorganized' : path}`);
+    await reload();
+  }
+
+  // ─── Create Folder ────────────────────────────────────────────────────
+
+  function createFolder() {
+    const existing = getAllFolderPaths().filter(p => p !== ROOT_FOLDER);
+    const optionsHtml = existing.map(p => `<option value="${escHtml(p)}">`).join('');
+
+    openModal('New Folder',
+      `<div class="vmf-form-group">
+        <label>Folder path</label>
+        <input id="vmf-new-folder-input" list="vmf-existing-folders" placeholder="/Production/Web">
+        <datalist id="vmf-existing-folders">${optionsHtml}</datalist>
+        <div style="font-size:11px;color:#6c757d;margin-top:6px;">
+          Use / separators for nested folders.<br>
+          The folder will appear after you move at least one VM into it.
+        </div>
+      </div>`,
+      [
+        { label: 'Cancel', cls: '', fn: 'vmf.closeModal()' },
+        { label: 'Create & Select', cls: 'vmf-btn-primary', fn: 'vmf.confirmCreateFolder()' }
+      ]
+    );
+    setTimeout(() => document.getElementById('vmf-new-folder-input')?.focus(), 50);
+  }
+
+  function confirmCreateFolder() {
+    const input = document.getElementById('vmf-new-folder-input');
+    if (!input) return;
+    let path = (input.value || '').trim();
+    if (!path) { showToast('Enter a folder path', true); return; }
+    if (!path.startsWith('/')) path = '/' + path;
+    closeModal();
+    // Pre-register path in the tree even before VMs are moved in
+    if (!folders[path]) folders[path] = [];
+    renderFolderTree();
+    selectFolder(path);
+    showToast(`Folder ${path} ready — move VMs into it`);
+  }
+
+  // ─── Drag and Drop ────────────────────────────────────────────────────
+
+  let dragVmId = null;
+
+  function onDragStart(event, id) {
+    dragVmId = id;
+    event.dataTransfer.effectAllowed = 'move';
+  }
+
+  function onDropFolder(event, path) {
+    event.preventDefault();
+    if (dragVmId != null) {
+      applyFolderMove([dragVmId], path);
+      dragVmId = null;
+    }
+  }
+
+  function onDropRow(event, targetId) {
+    event.preventDefault();
+    // Dropping one VM row onto another — ignore (no reorder needed)
+    dragVmId = null;
+  }
+
+  // ─── Modal ────────────────────────────────────────────────────────────
+
+  function openModal(title, bodyHtml, buttons) {
+    document.getElementById('vmf-modal-title').textContent = title;
+    document.getElementById('vmf-modal-body').innerHTML = bodyHtml;
+    document.getElementById('vmf-modal-footer').innerHTML = buttons.map(b =>
+      `<button class="vmf-btn ${b.cls}" onclick="${b.fn}">${b.label}</button>`
+    ).join('');
+    document.getElementById('vmf-modal').style.display = 'flex';
+  }
+
+  function closeModal() {
+    document.getElementById('vmf-modal').style.display = 'none';
+  }
+
+  // ─── Helpers ────────────────────────────────────────────────────────
+
+  function setStatus(msg) {
+    const el = document.getElementById('vmf-statusbar');
+    if (el) el.textContent = msg;
+  }
+
+  function showToast(msg, isError = false) {
+    const t = document.getElementById('vmf-toast');
+    t.textContent = msg;
+    t.className = isError ? 'error show' : 'show';
+    clearTimeout(t._timer);
+    t._timer = setTimeout(() => { t.className = ''; }, 3000);
+  }
+
+  function escHtml(s) {
+    return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+  }
+
+  function folderBasename(path) {
+    return path.split('/').filter(Boolean).pop() || '/';
+  }
+
+  function statusDotClass(status) {
+    const s = (status || '').toLowerCase();
+    if (s === 'on' || s === 'running' || s === 'poweron') return 'vmf-status-running';
+    if (s === 'off' || s === 'stopped' || s === 'poweroff') return 'vmf-status-stopped';
+    if (s === 'starting' || s === 'stopping' || s === 'provisioning') return 'vmf-status-pending';
+    return 'vmf-status-unknown';
+  }
+
+  function statusRank(vm) {
+    const cls = statusDotClass(vm.powerState || vm.status);
+    return cls === 'vmf-status-running' ? '0' : cls === 'vmf-status-pending' ? '1' : '2';
+  }
+
+  // ─── Close modal on backdrop click ──────────────────────────────────
+  document.getElementById('vmf-modal').addEventListener('click', function(e) {
+    if (e.target === this) closeModal();
+  });
+
+  // ─── Keyboard shortcuts ──────────────────────────────────────────────
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') closeModal();
+    if (e.key === 'F5' || (e.key === 'r' && e.ctrlKey)) { e.preventDefault(); reload(); }
+  });
+
+  // Public API
+  return { init, reload, selectFolder, toggleSelect, toggleAll, sort, filterVms,
+           moveSingleVm, moveSelected, confirmMove, removeSingleVm, removeFromFolder,
+           createFolder, confirmCreateFolder, closeModal,
+           onDragStart, onDropFolder, onDropRow };
+
+})();
+
+// Boot
+vmf.init();
+</script>
+</body>
+</html>

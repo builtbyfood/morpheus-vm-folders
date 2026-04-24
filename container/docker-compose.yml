@@ -1,0 +1,43 @@
+services:
+  vmfolders:
+    build: .
+    container_name: vmfolders
+    ports:
+      - "8090:80"
+    volumes:
+      # Option A: Local volume (data stays in Docker volume)
+      - vmfolders_data:/data
+
+      # Option B: NAS mount (uncomment to share data with Morpheus plugin)
+      # Mount your NAS path where vm-folders.json lives
+      # - type: bind
+      #   source: /mnt/nas/morpheus-plugins   # adjust to your NAS mount point
+      #   target: /data
+
+      # Option C: Direct bind to Morpheus appliance path via NFS
+      # Requires NFS mount on Docker host first:
+      #   sudo mount 192.168.0.30:/share/morpheus-plugins /mnt/morpheus-plugins
+      # - /mnt/morpheus-plugins:/data
+
+    environment:
+      - DB_PATH=/data/vm-folders.json
+      - BAK_PATH=/data/vm-folders.json.bak
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/vmfolders-api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  vmfolders_data:
+    driver: local
+
+# To share with Morpheus plugin via NFS, instead use:
+# volumes:
+#   vmfolders_data:
+#     driver: local
+#     driver_opts:
+#       type: nfs
+#       o: addr=192.168.0.30,rw,soft
+#       device: ":/share/morpheus-plugins"

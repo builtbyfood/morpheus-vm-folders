@@ -1,0 +1,15 @@
+[Unit]
+Description=VM Folders Companion API
+After=network.target
+
+[Service]
+Type=simple
+User=morpheus-app
+ExecStart=/usr/bin/python3 /opt/morpheus/vmfolders-api.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
