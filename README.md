@@ -1,6 +1,6 @@
 # morpheus-vm-folders-plugin
 
-A vCenter-style VM folder organization plugin for HPE Morpheus.  
+A VM folder organization plugin for HPE Morpheus.  
 Organize, move, and manage VMs in a persistent folder tree — directly from the Morpheus UI.
 
 ![VM Folders Screenshot](docs/screenshot.png)
