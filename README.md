@@ -1,10 +1,10 @@
 # morpheus-vm-folders-plugin
 
-A VM folder organization plugin for HPE Morpheus VM Essentials / Enterprise / Community Edition.  
-Organize, move, and manage VMs in a persistent folder tree.
+A vCenter-style VM folder organization plugin for HPE Morpheus.  
+Organize, move, and manage VMs in a persistent folder tree — directly from the Morpheus UI.
 
 ![VM Folders Screenshot](docs/screenshot.png)
-![VM Folders Screenshot](docs/screenshot-dark.png)
+
 ---
 
 ## Features
@@ -46,7 +46,7 @@ Organize, move, and manage VMs in a persistent folder tree.
 
 ## Quick Install (no build required)
 
-1. Download the latest jar from [Releases](https://github.com/builtbyfood/morpheus-vm-folders/tree/main/releases)
+1. Download the latest jar from [Releases](https://github.com/YOUR_USERNAME/morpheus-vm-folders-plugin/releases/latest)
 2. In Morpheus: **Admin → Integrations → Plugins → Upload**
 3. Select the jar file and click Upload
 4. Navigate to: `https://your-morpheus-url/plugin/vmFolders`

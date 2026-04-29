@@ -188,7 +188,16 @@
       if (mb) vmfMoveSingle(parseInt(mb.dataset.id));
       if (rb) vmfRemoveSingle(parseInt(rb.dataset.id));
       if (sh) vmfSort(sh.getAttribute('data-sort'));
-      if (pb) vmfPower(parseInt(pb.dataset.id), pb.dataset.action);
+      if (pb && !pb.disabled) {
+        var pid = parseInt(pb.dataset.id), paction = pb.dataset.action;
+        var pname = (allVms.find(function(v){return v.id===pid;})||{}).name || 'VM '+pid;
+        var plabel = paction==='start' ? 'Start' : paction==='stop' ? 'Stop' : 'Restart';
+        openConfirm(plabel+' VM', plabel+' "'+esc(pname)+'"?', function() {
+          pb.disabled = true; pb.style.opacity = '0.5';
+          setTimeout(function() { pb.disabled = false; pb.style.opacity = ''; }, 8000);
+          vmfPower(pid, paction);
+        });
+      }
     });
     setStatus(vms.length+' VM'+(vms.length!==1?'s':'')+(searchQ?' (filtered)':''));
   }
@@ -357,6 +366,59 @@
     var t=document.getElementById('vmf-toast'); if(!t) return;
     t.textContent=msg; t.className=err?'err':''; t.style.opacity='1';
     clearTimeout(t._t); t._t=setTimeout(function(){t.style.opacity='0';},3500);
+  };
+
+
+  window.vmfShowLogs = async function() {
+    openModal('Plugin Logs', [
+      '<div class="vmf-fg"><label>Filter</label><input id="vmf-lf" value="VmFolder"><div class="vmf-hint">Use ALL for everything, or any string to filter</div></div>' +
+      '<div id="vmf-log-out" style="background:#1e2d3d;color:#a8c7a8;font-family:monospace;font-size:11px;padding:10px;border-radius:4px;max-height:300px;overflow-y:auto;white-space:pre-wrap">Loading...</div>'
+    ], [
+      {l:'Close', fn:vmfCloseModal},
+      {l:'Refresh', primary:true, fn:async function(){
+        var f=document.getElementById('vmf-lf');
+        await loadLogs(f?f.value:'VmFolder');
+      }},
+      {l:'Export .txt', fn:function(){ vmfCloseModal(); vmfExportLogs(); }}
+    ]);
+    await loadLogs('VmFolder');
+  };
+
+  async function loadLogs(filter) {
+    var out = document.getElementById('vmf-log-out');
+    if (!out) return;
+    out.textContent = 'Loading...';
+    try {
+      var d = await get('/logs?lines=200&filter='+encodeURIComponent(filter||'VmFolder'));
+      if (d.success) {
+        out.textContent = d.lines.join('\n') || '(no matching lines)';
+        out.scrollTop = out.scrollHeight;
+        vmfToast('DB v'+d.dbVersion+' | '+d.dbFolders+' folders | '+d.dbAssigned+' assigned');
+      } else { out.textContent = 'Error: '+d.error; }
+    } catch(e){ out.textContent = 'Error: '+e.message; }
+  }
+
+  window.vmfExportLogs = async function() {
+    vmfToast('Collecting logs...');
+    try {
+      var d = await get('/logs?lines=2000&filter=ALL');
+      if (!d.success) { vmfToast('Log export failed: '+d.error, true); return; }
+      var text = [
+        '# VM Folders Plugin Log Export',
+        '# Exported: ' + new Date().toISOString(),
+        '# DB Version: ' + d.dbVersion,
+        '# Folders: ' + d.dbFolders + ' | Assigned VMs: ' + d.dbAssigned,
+        '# ============================================================',
+        ''
+      ].join('\n') + d.lines.join('\n');
+      var blob = new Blob([text], {type:'text/plain'});
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url; a.download = 'vm-folders-logs-'+new Date().toISOString().slice(0,19).replace(/:/g,'-')+'.txt';
+      document.body.appendChild(a); a.click();
+      document.body.removeChild(a); URL.revokeObjectURL(url);
+      vmfToast('Logs exported ('+d.lineCount+' lines)');
+    } catch(e) { vmfToast('Export error: '+e.message, true); }
   };
 
   function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}

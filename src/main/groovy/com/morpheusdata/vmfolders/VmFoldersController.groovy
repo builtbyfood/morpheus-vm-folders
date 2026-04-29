@@ -54,7 +54,8 @@ class VmFoldersController implements PluginController {
             p("/vmFolders/backup",    "backup"),
             p("/vmFolders/restore",   "restore"),
             p("/vmFolders/export",    "export"),
-            p("/vmFolders/power",     "power")
+            p("/vmFolders/power",     "power"),
+            p("/vmFolders/logs",      "logs")
         ]
     }
 
@@ -310,6 +311,37 @@ class VmFoldersController implements PluginController {
         }
     }
 
+
+    // ── API: log collection ───────────────────────────────────────────
+    def logs(ViewModel<Map> model) {
+        try {
+            def lines  = (model?.request?.getParameter('lines') ?: '200') as Integer
+            def filter = model?.request?.getParameter('filter') ?: 'VmFolder'
+            def logFile = new File('/var/log/morpheus/morpheus-ui/current')
+            def result = []
+            if (logFile.exists()) {
+                logFile.withReader { reader ->
+                    def all = reader.readLines()
+                    result = filter == 'ALL' ? all : all.findAll { it.contains(filter) }
+                    if (result.size() > lines) result = result.takeRight(lines)
+                }
+            }
+            def db = readDb()
+            return JsonResponse.of([
+                success    : true,
+                lines      : result,
+                lineCount  : result.size(),
+                filter     : filter,
+                dbVersion  : db.version,
+                dbModified : db.lastModified,
+                dbFolders  : (db.folders as List)?.size() ?: 0,
+                dbAssigned : (db.assignments as Map)?.size() ?: 0
+            ])
+        } catch(e) {
+            return JsonResponse.of([success: false, error: e.message, lines: []])
+        }
+    }
+
     // ── API: power control ────────────────────────────────────────────
     def power(ViewModel<Map> model) {
         try {
@@ -480,6 +512,7 @@ class VmFoldersController implements PluginController {
       <button class="vmf-btn vmf-btn-outline vmf-btn-sm" id="vmf-restore-btn" title="Restore from backup">&#9100; Restore</button>
       <a class="vmf-btn vmf-btn-outline vmf-btn-sm" id="vmf-export-btn" href="/plugin/vmFolders/export" target="_blank" title="Export database">&#8595; Export</a>
       <button class="vmf-btn vmf-btn-outline vmf-btn-sm" id="vmf-theme-btn" title="Toggle dark/light mode">&#9681;</button>
+      <button class="vmf-btn vmf-btn-outline vmf-btn-sm" id="vmf-logs-btn" title="View plugin logs">&#128196; Logs</button>
       <button class="vmf-btn vmf-btn-outline vmf-btn-sm" id="vmf-refresh-btn">&#8635; Refresh</button>
       <button class="vmf-btn vmf-btn-primary vmf-btn-sm" id="vmf-new-folder-btn">+ Folder</button>
     </div>
@@ -523,6 +556,7 @@ class VmFoldersController implements PluginController {
         localStorage.setItem('vmf-theme', isDark ? 'dark' : 'light');
         this.textContent = isDark ? '\u2600' : '\u263D';
       });
+      document.getElementById('vmf-logs-btn').addEventListener('click', function() { vmfShowLogs(); });
       document.getElementById('vmf-refresh-btn').addEventListener('click', function() { vmfReload(); });
       document.getElementById('vmf-new-folder-btn').addEventListener('click', function() { vmfCreateFolder(); });
       document.getElementById('vmf-mv-btn').addEventListener('click', function() { vmfMoveSelected(); });

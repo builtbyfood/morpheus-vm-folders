@@ -1,0 +1,17 @@
+# Build output
+build/
+.gradle/
+*.class
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Compiled jar (kept in releases, not repo root)
+# Uncomment if you don't want jars in the repo:
+# *.jar

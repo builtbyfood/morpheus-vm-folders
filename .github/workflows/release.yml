@@ -1,0 +1,44 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 11
+        uses: actions/setup-java@v4
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+
+      - name: Set up Gradle 7.6.4
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '7.6.4'
+
+      - name: Build plugin jar
+        run: gradle shadowJar --no-daemon
+
+      - name: Get version
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/libs/morpheus-vm-folders-plugin-*.jar
+          name: VM Folders Plugin v${{ steps.version.outputs.VERSION }}
+          body: |
+            ## Install
+
+            1. Download `morpheus-vm-folders-plugin-${{ steps.version.outputs.VERSION }}-all.jar`
+            2. In Morpheus: **Admin → Integrations → Plugins → Upload**
+            3. Navigate to: `https://your-morpheus-url/plugin/vmFolders`
+
+            See [README](https://github.com/${{ github.repository }}#readme) for full documentation.
