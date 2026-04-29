@@ -46,7 +46,7 @@ Organize, move, and manage VMs in a persistent folder tree — directly from the
 
 ## Quick Install (no build required)
 
-1. Download the latest jar from [Releases](https://github.com/YOUR_USERNAME/morpheus-vm-folders-plugin/releases/latest)
+1. Download the latest jar from [Releases](https://github.com/builtbyfood/morpheus-vm-folders/releases/latest)
 2. In Morpheus: **Admin → Integrations → Plugins → Upload**
 3. Select the jar file and click Upload
 4. Navigate to: `https://your-morpheus-url/plugin/vmFolders`
@@ -148,7 +148,7 @@ A backup is automatically created at `vm-folders.json.bak` on every write.
 - SDKMAN for Gradle (`sdk install gradle 7.6.4`)
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/morpheus-vm-folders-plugin
+git clone https://github.com/builtbyfood/morpheus-vm-folders
 cd morpheus-vm-folders-plugin
 
 sdk use gradle 7.6.4
