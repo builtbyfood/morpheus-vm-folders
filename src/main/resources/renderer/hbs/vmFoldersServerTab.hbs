@@ -1,0 +1,103 @@
+<style nonce="{{nonce}}">
+  #vmf-st * { box-sizing:border-box; }
+  #vmf-st { padding:0; background:var(--hpe-bg,#F5F5F5); min-height:500px; display:flex; flex-direction:column; }
+  #vmf-st-hdr { display:flex; align-items:center; gap:8px; padding:10px 16px; background:var(--hpe-header,#425563); color:#fff; flex-shrink:0; }
+  #vmf-st-hdr h3 { font-size:14px; font-weight:600; display:flex; align-items:center; gap:6px; font-family:-apple-system,sans-serif; margin:0; }
+  #vmf-st-hdr h3::before { content:''; display:inline-block; width:3px; height:16px; background:#01A982; border-radius:2px; }
+  .vmf-hbadge { background:rgba(0,0,0,.3); color:#ECF0F1; border-radius:3px; padding:2px 8px; font-size:10px; font-weight:600; }
+  .vmf-hbtn { padding:4px 10px; border-radius:4px !important; font-size:11px; cursor:pointer; white-space:nowrap; border:1px solid rgba(255,255,255,.4) !important; background:transparent !important; color:#fff !important; font-family:-apple-system,sans-serif; }
+  .vmf-hbtn:hover { border-color:#fff !important; background:rgba(255,255,255,.1) !important; }
+  #vmf-st .vmf-main { display:flex; flex:1; overflow:hidden; min-height:420px; }
+  #vmf-st #vmf-cloud-bar { display:flex; flex-wrap:wrap; gap:3px; padding:6px 10px; background:var(--hpe-bg,#F5F5F5); border-bottom:1px solid var(--hpe-border,#CCCCCC); flex-shrink:0; }
+  #vmf-st #vmf-tree { width:190px; background:var(--hpe-white,#fff); border-right:1px solid var(--hpe-border,#CCCCCC); display:flex; flex-direction:column; overflow:hidden; flex-shrink:0; }
+  #vmf-st #vmf-tree-head { padding:8px 12px; font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:.07em; color:var(--hpe-muted,#767676); background:var(--hpe-bg,#F5F5F5); border-bottom:1px solid var(--hpe-border,#CCCCCC); }
+  #vmf-st #vmf-flist { flex:1; overflow-y:auto; padding:3px 0; }
+  #vmf-st .vmf-fi { display:flex; align-items:center; gap:6px; padding:5px 12px; cursor:pointer; border-left:3px solid transparent; font-size:12px; font-family:-apple-system,sans-serif; color:var(--hpe-text,#333); }
+  #vmf-st .vmf-fi:hover { background:var(--hpe-row-hover,#F9FAFA); }
+  #vmf-st .vmf-fi.active { background:var(--hpe-selected,#E6F5F1); border-left-color:#01A982; color:#008567; font-weight:600; }
+  #vmf-st .vmf-fi-icon { font-size:12px; flex-shrink:0; }
+  #vmf-st .vmf-fi-name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #vmf-st .vmf-fi-count { font-size:10px; background:var(--hpe-border,#eee); color:var(--hpe-muted,#767676); border-radius:8px; padding:0 5px; flex-shrink:0; }
+  #vmf-st .vmf-fi.active .vmf-fi-count { background:#c8ede4; color:#008567; }
+  #vmf-st .vmf-divider { height:1px; background:var(--hpe-border,#CCCCCC); margin:2px 0; opacity:.5; }
+  #vmf-st #vmf-content { flex:1; display:flex; flex-direction:column; overflow:hidden; }
+  #vmf-st #vmf-toolbar { display:flex; align-items:center; gap:6px; padding:7px 12px; background:var(--hpe-white,#fff); border-bottom:1px solid var(--hpe-border,#CCCCCC); flex-shrink:0; flex-wrap:wrap; }
+  #vmf-st #vmf-search { padding:4px 8px; border:1px solid var(--hpe-border,#CCCCCC); border-radius:4px !important; font-size:12px; max-width:200px; background:var(--hpe-white,#fff); color:var(--hpe-text,#333); }
+  #vmf-st #vmf-search:focus { outline:none; border-color:#01A982; }
+  #vmf-st #vmf-bc { font-size:11px; color:var(--hpe-muted,#767676); font-family:-apple-system,sans-serif; }
+  #vmf-st #vmf-vlist { flex:1; overflow-y:auto; background:var(--hpe-white,#fff); }
+  #vmf-st #vmf-status { padding:4px 12px; background:var(--hpe-bg,#F5F5F5); border-top:1px solid var(--hpe-border,#CCCCCC); font-size:10px; color:var(--hpe-muted,#767676); font-family:-apple-system,sans-serif; }
+  #vmf-st table.vmft { width:100%; border-collapse:collapse; background:var(--hpe-white,#fff); }
+  #vmf-st table.vmft thead th { position:sticky; top:0; background:var(--hpe-bg,#F5F5F5); border-bottom:2px solid var(--hpe-border,#CCCCCC); padding:6px 8px; text-align:left; font-weight:600; font-size:10px; text-transform:uppercase; color:var(--hpe-muted,#767676); white-space:nowrap; cursor:pointer; font-family:-apple-system,sans-serif; }
+  #vmf-st table.vmft tbody tr { border-bottom:1px solid var(--hpe-border,#f0f0f0); }
+  #vmf-st table.vmft tbody tr:hover { background:var(--hpe-row-hover,#F9FAFA); }
+  #vmf-st table.vmft tbody tr.sel { background:var(--hpe-selected,#E6F5F1); }
+  #vmf-st table.vmft td { padding:5px 8px; font-size:11px; font-family:-apple-system,sans-serif; vertical-align:middle; color:var(--hpe-text,#333); }
+  #vmf-st .vmft-name a { color:#008567; text-decoration:none; font-weight:500; }
+  #vmf-st .vmft-name a:hover { text-decoration:underline; }
+  #vmf-st .vmf-dot { display:inline-block; width:6px; height:6px; border-radius:50%; margin-right:3px; vertical-align:middle; }
+  #vmf-st .vmf-tag { background:var(--hpe-selected,#e6f5f1); color:#008567; border-radius:3px; padding:1px 6px; font-size:10px; font-weight:500; border:1px solid #b3e0d5; }
+  /* Compact action buttons — override Morpheus default button styles */
+  #vmf-st .vmf-act { padding:2px 7px !important; font-size:11px !important; border:1px solid var(--hpe-border,#CCCCCC) !important; border-radius:3px !important; background:var(--hpe-white,#fff) !important; cursor:pointer !important; color:var(--hpe-text,#333) !important; font-family:-apple-system,sans-serif !important; line-height:1.4 !important; min-height:0 !important; height:auto !important; }
+  #vmf-st .vmf-act:hover { border-color:#01A982 !important; color:#008567 !important; }
+  #vmf-st .vmf-act-more { font-weight:bold; letter-spacing:1px; }
+  #vmf-st .vmf-pw-btn { color:#fff !important; }
+  #vmf-st .vmf-empty, #vmf-st .vmf-spin { display:flex; align-items:center; justify-content:center; padding:30px; color:var(--hpe-muted,#767676); font-family:-apple-system,sans-serif; gap:8px; font-size:12px; }
+  #vmf-st .vmf-spinner { width:14px; height:14px; border:2px solid var(--hpe-border,#CCCCCC); border-top-color:#01A982; border-radius:50%; animation:vmfSpin .7s linear infinite; }
+  @keyframes vmfSpin { to { transform:rotate(360deg); } }
+</style>
+
+<div id="vmf-st">
+  <div id="vmf-st-hdr">
+    <h3>VM Folders</h3>
+    <span class="vmf-hbadge">{{object.serverName}}</span>
+    <button class="vmf-hbtn" id="vmf-resync-btn" title="Re-sync VMs to current host folders">&#8635; Re-sync</button>
+    <a href="/plugin/vmFolders" target="_blank" class="vmf-hbtn" style="text-decoration:none;margin-left:auto;">Open Full View ↗</a>
+  </div>
+  <div class="vmf-main">
+    <div id="vmf-tree">
+      <div id="vmf-cloud-bar"></div>
+      <div id="vmf-tree-head">Folders</div>
+      <div id="vmf-flist"><div class="vmf-spin"><div class="vmf-spinner"></div>Loading...</div></div>
+    </div>
+    <div id="vmf-content">
+      <div id="vmf-toolbar">
+        <input id="vmf-search" type="text" placeholder="Search VMs...">
+        <span id="vmf-bc">&#128193; <b>All VMs</b></span>
+      </div>
+      <div id="vmf-vlist"><div class="vmf-spin"><div class="vmf-spinner"></div>Loading VMs...</div></div>
+      <div id="vmf-status">Loading...</div>
+    </div>
+  </div>
+</div>
+
+<script nonce="{{nonce}}">
+  window.vmfReadOnly = true;
+  window.vmfHostId = '{{object.serverId}}';
+
+  function vmfInitServerTab() {
+    // Rename wrapper div to match vmFolders.js expected IDs
+    var wrap = document.getElementById('vmf-st');
+    if (wrap) { wrap.id = 'vmf-server-tab-wrap'; }
+    var rsync = document.getElementById('vmf-resync-btn');
+    if (rsync) rsync.addEventListener('click', function() {
+      if (typeof vmfResyncHosts === 'function') vmfResyncHosts();
+    });
+    if (typeof vmfReload === 'function') {
+      vmfReload();
+    } else {
+      var s = document.createElement('script');
+      s.src = '/assets/plugin/vm-folders/vmFolders.js';
+      s.nonce = '{{nonce}}';
+      s.onload = function() {
+        var rsync2 = document.getElementById('vmf-resync-btn');
+        if (rsync2) rsync2.addEventListener('click', function() {
+          if (typeof vmfResyncHosts === 'function') vmfResyncHosts();
+        });
+        if (typeof vmfReload === 'function') vmfReload();
+      };
+      document.head.appendChild(s);
+    }
+  }
+  vmfInitServerTab();
+</script>

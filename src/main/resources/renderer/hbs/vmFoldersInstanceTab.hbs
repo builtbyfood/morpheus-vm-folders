@@ -1,0 +1,130 @@
+<style nonce="{{nonce}}">
+  #vmf-inst-wrap { padding:20px; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; }
+  #vmf-inst-wrap * { box-sizing:border-box; }
+  .vmf-inst-card { background:#fff; border:1px solid #CCCCCC; border-radius:6px; overflow:hidden; max-width:600px; }
+  .vmf-inst-head { background:#425563; color:#fff; padding:12px 16px; display:flex; align-items:center; gap:8px; }
+  .vmf-inst-head h3 { font-size:14px; font-weight:600; display:flex; align-items:center; gap:6px; margin:0; }
+  .vmf-inst-head h3::before { content:''; display:inline-block; width:3px; height:16px; background:#01A982; border-radius:2px; }
+  .vmf-inst-body { padding:20px; }
+  .vmf-inst-row { display:flex; align-items:center; gap:12px; padding:10px 0; border-bottom:1px solid #f0f0f0; }
+  .vmf-inst-row:last-child { border-bottom:none; }
+  .vmf-inst-label { font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.05em; color:#767676; width:100px; flex-shrink:0; }
+  .vmf-inst-val { font-size:13px; color:#333; flex:1; }
+  .vmf-inst-val.folder { color:#008567; font-weight:500; }
+  .vmf-inst-val.unorg { color:#767676; font-style:italic; }
+  .vmf-inst-actions { display:flex; gap:8px; padding-top:16px; }
+  .vmf-inst-btn { padding:7px 14px; border-radius:4px; font-size:12px; font-weight:500; cursor:pointer; text-decoration:none; display:inline-flex; align-items:center; gap:5px; }
+  .vmf-inst-btn-primary { background:#01A982; border:1px solid #008567; color:#fff; }
+  .vmf-inst-btn-primary:hover { background:#008567; }
+  .vmf-inst-btn-outline { background:#fff; border:1px solid #CCCCCC; color:#333; }
+  .vmf-inst-btn-outline:hover { border-color:#01A982; color:#008567; }
+  .vmf-inst-loading { color:#767676; font-size:13px; display:flex; align-items:center; gap:8px; }
+  .vmf-inst-spinner { width:14px; height:14px; border:2px solid #CCCCCC; border-top-color:#01A982; border-radius:50%; animation:vmfInstSpin .7s linear infinite; }
+  @keyframes vmfInstSpin { to { transform:rotate(360deg); } }
+  .vmf-inst-move-form { display:none; margin-top:12px; padding:12px; background:#F5F5F5; border-radius:4px; border:1px solid #CCCCCC; }
+  .vmf-inst-move-form label { display:block; font-size:11px; font-weight:600; margin-bottom:4px; color:#767676; text-transform:uppercase; }
+  .vmf-inst-move-form input { width:100%; padding:7px 10px; border:1px solid #CCCCCC; border-radius:4px; font-size:13px; margin-bottom:8px; }
+  .vmf-inst-move-form input:focus { outline:none; border-color:#01A982; }
+</style>
+
+<div id="vmf-inst-wrap">
+  <div class="vmf-inst-card">
+    <div class="vmf-inst-head">
+      <h3>VM Folders</h3>
+      <span style="font-size:11px;color:#B0BEC5;">{{object.instanceName}}</span>
+      <a href="{{object.pluginUrl}}" target="_blank"
+         style="margin-left:auto;font-size:11px;color:#B0BEC5;text-decoration:none;border:1px solid rgba(255,255,255,.3);padding:3px 8px;border-radius:3px;">
+        Full View ↗
+      </a>
+    </div>
+    <div class="vmf-inst-body">
+      <div id="vmf-inst-content">
+        <div class="vmf-inst-loading">
+          <div class="vmf-inst-spinner"></div>
+          Loading folder info...
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script nonce="{{nonce}}">
+(function() {
+  var serverId = '{{object.serverId}}';
+  var instanceName = '{{object.instanceName}}';
+  var pluginUrl = '{{object.pluginUrl}}';
+
+  function render(folder) {
+    var isOrg = folder && folder !== '/';
+    var folderDisplay = isOrg
+      ? '<span class="vmf-inst-val folder">&#128193; ' + esc(folder) + '</span>'
+      : '<span class="vmf-inst-val unorg">Unorganized</span>';
+
+    var html = '<div class="vmf-inst-row">' +
+      '<span class="vmf-inst-label">Instance</span>' +
+      '<span class="vmf-inst-val">' + esc(instanceName) + '</span></div>' +
+      '<div class="vmf-inst-row">' +
+      '<span class="vmf-inst-label">Server ID</span>' +
+      '<span class="vmf-inst-val">' + esc(serverId || '—') + '</span></div>' +
+      '<div class="vmf-inst-row">' +
+      '<span class="vmf-inst-label">Folder</span>' +
+      folderDisplay + '</div>';
+
+    html += '<div class="vmf-inst-actions">' +
+      '<a href="' + pluginUrl + '" target="_blank" class="vmf-inst-btn vmf-inst-btn-outline">&#128196; Open VM Folders</a>' +
+      '<button class="vmf-inst-btn vmf-inst-btn-outline" onclick="vmfInstToggleMove()">&#128193; ' + (isOrg ? 'Move Folder' : 'Assign Folder') + '</button>' +
+      '</div>';
+
+    html += '<div class="vmf-inst-move-form" id="vmf-inst-mf">' +
+      '<label>Folder Path</label>' +
+      '<input id="vmf-inst-fp" type="text" placeholder="/Production/Web" value="' + (isOrg ? esc(folder) : '') + '">' +
+      '<div style="display:flex;gap:6px;">' +
+      '<button class="vmf-inst-btn vmf-inst-btn-primary" onclick="vmfInstSave()">Save</button>' +
+      '<button class="vmf-inst-btn vmf-inst-btn-outline" onclick="vmfInstToggleMove()">Cancel</button>' +
+      (isOrg ? '<button class="vmf-inst-btn vmf-inst-btn-outline" style="color:#c00;border-color:#c00" onclick="vmfInstRemove()">Remove</button>' : '') +
+      '</div></div>';
+
+    document.getElementById('vmf-inst-content').innerHTML = html;
+  }
+
+  function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+  window.vmfInstToggleMove = function() {
+    var f = document.getElementById('vmf-inst-mf');
+    if (f) f.style.display = f.style.display === 'none' || !f.style.display ? 'block' : 'none';
+  };
+
+  window.vmfInstSave = async function() {
+    var el = document.getElementById('vmf-inst-fp');
+    if (!el || !serverId) return;
+    var path = el.value.trim();
+    if (!path) return;
+    if (!path.startsWith('/')) path = '/' + path;
+    try {
+      var r = await fetch('/plugin/vmFolders/assign?vmId=' + serverId + '&path=' + encodeURIComponent(path));
+      var d = await r.json();
+      if (d.success) { render(path); } else { alert('Failed: ' + d.error); }
+    } catch(e) { alert('Error: ' + e.message); }
+  };
+
+  window.vmfInstRemove = async function() {
+    if (!serverId) return;
+    if (!confirm('Remove from folder?')) return;
+    try {
+      var r = await fetch('/plugin/vmFolders/unassign?vmId=' + serverId);
+      var d = await r.json();
+      if (d.success) { render(''); } else { alert('Failed: ' + d.error); }
+    } catch(e) { alert('Error: ' + e.message); }
+  };
+
+  // Load current folder from DB
+  fetch('/plugin/vmFolders/db').then(function(r) { return r.json(); }).then(function(db) {
+    var assignments = db.assignments || {};
+    var folder = serverId ? (assignments[serverId] || '') : '';
+    render(folder);
+  }).catch(function(e) {
+    document.getElementById('vmf-inst-content').innerHTML =
+      '<div style="color:#c00;font-size:13px;">Could not load folder data: ' + e.message + '</div>';
+  });
+})();
+</script>

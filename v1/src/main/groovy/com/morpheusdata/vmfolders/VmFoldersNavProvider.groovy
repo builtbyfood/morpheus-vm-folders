@@ -4,24 +4,11 @@ import com.morpheusdata.core.AbstractGlobalUIComponentProvider
 import com.morpheusdata.core.MorpheusContext
 import com.morpheusdata.core.Plugin
 import com.morpheusdata.model.Account
+import com.morpheusdata.model.ContentSecurityPolicy
 import com.morpheusdata.model.User
 import com.morpheusdata.views.HTMLResponse
-import com.morpheusdata.views.ViewModel
 import groovy.util.logging.Slf4j
 
-/**
- * Injects vmFolders.js into every Morpheus page via a nonced script tag.
- * The JS uses a MutationObserver to detect infrastructure pages and injects
- * a "Folder View" tab into Bootstrap's #nav-tabs-wrapper tab bar.
- *
- * Asset path: /assets/plugin/vm-folders/vmFolders.js
- * HBS template: src/main/resources/renderer/hbs/vmFoldersNav.hbs
- *
- * Confirmed working on Morpheus 8.1.1 HPE VME:
- * - getRenderer().renderTemplate() substitutes {{nonce}} correctly
- * - Asset is served at /assets/plugin/vm-folders/vmFolders.js
- * - Bootstrap data-toggle="tab" injection works on #nav-tabs-wrapper pages
- */
 @Slf4j
 class VmFoldersNavProvider extends AbstractGlobalUIComponentProvider {
 
@@ -50,13 +37,18 @@ class VmFoldersNavProvider extends AbstractGlobalUIComponentProvider {
 
     @Override
     HTMLResponse renderTemplate(User user, Account account) {
-        try {
-            ViewModel<Map> model = new ViewModel<>()
-            model.object = [:]
-            return getRenderer().renderTemplate('hbs/vmFoldersNav', model)
-        } catch(e) {
-            log.error("VmFoldersNavProvider.renderTemplate error: ${e.message}", e)
-            return HTMLResponse.success('')
-        }
+        // Outputs a non-executable script tag (type=text/plain) containing
+        // a loader that runs via DOM injection with the page nonce.
+        // The actual tab injection JS lives in the external asset file
+        // which is served from /assets/plugin/vm-folders/vmFolders.js
+        def html = '<script src="/assets/plugin/vm-folders/vmFolders.js"></script>'
+        return HTMLResponse.success(html)
+    }
+
+    @Override
+    ContentSecurityPolicy getContentSecurityPolicy() {
+        def csp = new ContentSecurityPolicy()
+        csp.scriptSrc = "'self'"
+        return csp
     }
 }

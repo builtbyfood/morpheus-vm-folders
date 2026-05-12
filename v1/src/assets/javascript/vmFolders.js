@@ -2,132 +2,32 @@
   var ROOT = '/';
   var allVms = [], storedFolders = [], activeFolder = '__all__', searchQ = '';
   var selectedIds = new Set(), sortCol = 'name', sortAsc = true;
-  var cloudFilter = '__all__';
-
-  // Expose syncDarkMode globally so it can be called from HBS templates
-  window.vmfSyncDark = function() {
-    var isDark = detectMorpheusDark();
-    var styleId = 'vmf-dark-vars';
-    var existing = document.getElementById(styleId);
-    if (isDark) {
-      if (!existing) {
-        var s = document.createElement('style');
-        s.id = styleId;
-        s.textContent = ':root{--hpe-bg:#1A1F2B!important;--hpe-white:#242B38!important;--hpe-border:#3A4458!important;--hpe-text:#E0E6F0!important;--hpe-muted:#8899B0!important;--hpe-selected:#1A3A30!important;--hpe-row-hover:#1E2535!important;--hpe-header:#2C3547!important;}';
-        document.head.appendChild(s);
-      }
-    } else {
-      if (existing) existing.remove();
-    }
-  };
-  // Run immediately when vmFolders.js loads on any page
-  window.vmfSyncDark();
-
-  function detectMorpheusDark() {
-    var selectors = ['.main-header','header.navbar','.navbar-header','.site-header','nav.navbar','body'];
-    for (var i = 0; i < selectors.length; i++) {
-      var el = document.querySelector(selectors[i]);
-      if (el) {
-        var bg = window.getComputedStyle(el).backgroundColor;
-        var rgb = bg.match(/\d+/g);
-        if (rgb && !(parseInt(rgb[0])===0&&parseInt(rgb[1])===0&&parseInt(rgb[2])===0)) {
-          return (parseInt(rgb[0])*299+parseInt(rgb[1])*587+parseInt(rgb[2])*114)/1000 < 80;
-        }
-      }
-    }
-    return false;
-  }
-  function syncDarkMode() {
-    if (!localStorage.getItem('vmf-theme')) {
-      if (detectMorpheusDark()) document.body.classList.add('dark');
-      else document.body.classList.remove('dark');
-    }
-  }
   var API = window.vmfApiBase || '/plugin/vmFolders';
 
   // ── Tab injection ──────────────────────────────────────────────────
-  // v1.1.0: Tab injection removed for compute pages
-
-
-
-  // v1.1.2: Cloud detail page injection
-  // v1.1.3: Provisioning page injection
-  function injectProvisioningLinks() {
-    // Inject into ALL ul.provisioning.subnav — covers both page tab bar AND hover popover
-    document.querySelectorAll('ul.provisioning.subnav').forEach(function(ul) {
-      if (ul.querySelector('.vmf-prov-li')) return;
-      var li = document.createElement('li');
-      li.className = 'vmf-prov-li';
-      li.innerHTML = '<a href="/plugin/vmFolders">&#128193; VM Folders</a>';
-      ul.appendChild(li);
-    });
-  }
-
-
-  function injectInfrastructureLinks() {
-    document.querySelectorAll('ul.infrastructure.admin-filters').forEach(function(ul) {
-      if (ul.querySelector('.vmf-infra-li')) return;
-      var li = document.createElement('li');
-      li.className = 'vmf-infra-li';
-      li.innerHTML = '<a href="/plugin/vmFolders">&#128193; VM Folders</a>';
-      ul.appendChild(li);
-    });
-  }
-
-  // v1.1.2: Cloud detail page injection
-  var cloudTabInjected = false;
-  function injectCloudTab() {
-    if (cloudTabInjected) return;
-    var path = window.location.pathname;
-    // Match cloud detail pages: /infrastructure/clouds/{id}
-    if (!path.match(/\/infrastructure\/clouds\/\d+/)) return;
+  var injected = false;
+  function tryInject() {
+    if (injected || window.location.href.indexOf('/infrastructure/') === -1) return;
     var tabBar = document.getElementById('nav-tabs-wrapper');
     var tabContent = document.querySelector('.tab-content');
-    if (!tabBar || !tabContent) return;
-    if (document.getElementById('vmf-cloud-tab-li')) return;
-
-    // Get cloud name from breadcrumb or page heading
-    var cloudName = '';
-    try {
-      var crumb = document.querySelector('.breadcrumb li:last-child a, .breadcrumb li:last-child span');
-      if (crumb) cloudName = crumb.textContent.trim();
-      if (!cloudName) {
-        var h1 = document.querySelector('h1, .detail-title, .page-title');
-        if (h1) cloudName = h1.textContent.trim();
-      }
-    } catch(e) {}
-
-    // Inject tab
+    if (!tabBar || !tabContent || document.getElementById('vmf-tab-li')) return;
     var li = document.createElement('li');
-    li.id = 'vmf-cloud-tab-li';
-    li.setAttribute('role','presentation');
-    li.innerHTML = '<a href="#" style="cursor:pointer">&#128193; VM Folders</a>';
-    tabBar.querySelector('ul') ? tabBar.querySelector('ul').appendChild(li) : tabBar.appendChild(li);
-    li.querySelector('a').addEventListener('click', function(e) {
-      e.preventDefault(); e.stopPropagation();
-      if (cloudName) { cloudFilter = cloudName; window.vmfContextCloud = cloudName; }
-      vmfShowOverlay();
-    });
-    cloudTabInjected = true;
+    li.id = 'vmf-tab-li'; li.setAttribute('role','presentation');
+    li.innerHTML = '<a href="#vmf-folders" aria-controls="vmf-folders" role="tab" data-toggle="tab">&#128193; Folder View</a>';
+    tabBar.appendChild(li);
+    var pane = document.createElement('div');
+    pane.id = 'vmf-folders'; pane.setAttribute('role','tabpanel'); pane.className = 'tab-pane';
+    pane.innerHTML = '<div style="padding:20px;text-align:center;color:#767676">Click to load Folder View</div>';
+    tabContent.appendChild(pane);
+    li.querySelector('a').addEventListener('click', function() { setTimeout(vmfReload, 150); });
+    injected = true;
   }
-
-  var _lastNavHref = window.location.href;
+  var lastHref = window.location.href;
   new MutationObserver(function() {
-    if (window.location.href !== _lastNavHref) {
-      _lastNavHref = window.location.href;
-      cloudTabInjected = false;
-      document.querySelectorAll('.vmf-prov-li').forEach(function(el){el.remove();});
-    }
-    if (window.location.href.includes('/infrastructure/clouds/')) injectCloudTab();
-    injectProvisioningLinks();
-  injectInfrastructureLinks();
-    injectInfrastructureLinks();
-    
-  
-  }).observe(document.body, {childList:true, subtree:true});
-  if (window.location.href.includes('/infrastructure/clouds/')) injectCloudTab();
-  injectProvisioningLinks();
-  injectInfrastructureLinks();
+    if (window.location.href !== lastHref) { lastHref = window.location.href; injected = false; }
+    tryInject();
+  }).observe(document.body, { childList: true, subtree: true });
+  tryInject();
 
   // ── API ────────────────────────────────────────────────────────────
   async function get(path) {
@@ -147,67 +47,22 @@
   function getVmFolder(vm) { return vm.folderPath || ROOT; }
 
   function allPaths() {
-    // Apply all active filters to determine visible VMs
-    var srcVms = allVms;
-    if (window.vmfHostId) srcVms = srcVms.filter(function(vm){ return String(vm.hostId||'') === String(window.vmfHostId); });
-    var activeCloud = (cloudFilter !== '__all__') ? cloudFilter : (window.vmfContextCloud || null);
-    if (activeCloud) srcVms = srcVms.filter(function(vm){ return (vm.cloudName||'') === activeCloud; });
-
-    // Build set of paths from visible VMs
-    var assignedPaths = new Set();
-    srcVms.forEach(function(vm){ var p=getVmFolder(vm); if(p!==ROOT) assignedPaths.add(p); });
-
-    // Only include stored folders that have VMs in current filter
-    var s = new Set();
-    storedFolders.forEach(function(f){
-      var hasVms = Array.from(assignedPaths).some(function(p){ return p===f.path || p.startsWith(f.path+'/'); });
-      if (hasVms) s.add(f.path);
+    var s = new Set(storedFolders.map(function(f) { return f.path; }));
+    allVms.forEach(function(vm) { var p = getVmFolder(vm); if (p !== ROOT) s.add(p); });
+    Array.from(s).forEach(function(p) {
+      var parts = p.split('/').filter(Boolean);
+      for (var i = 1; i < parts.length; i++) s.add('/' + parts.slice(0, i).join('/'));
     });
-    srcVms.forEach(function(vm){ var p=getVmFolder(vm); if(p!==ROOT) s.add(p); });
-    Array.from(s).forEach(function(p){var parts=p.split('/').filter(Boolean);for(var i=1;i<parts.length;i++)s.add('/'+parts.slice(0,i).join('/'));});
     return Array.from(s).sort();
   }
 
   function countIn(path) {
-    var src = allVms;
-    var ac = (cloudFilter !== '__all__') ? cloudFilter : (window.vmfContextCloud || null);
-    if (ac) src = src.filter(function(vm){ return (vm.cloudName||'') === ac; });
-    if (window.vmfHostId) src = src.filter(function(vm){ return String(vm.hostId||'') === String(window.vmfHostId); });
-    return src.filter(function(vm){var p=getVmFolder(vm); return p===path||p.startsWith(path+'/');}).length;
+    return allVms.filter(function(vm) { var p = getVmFolder(vm); return p === path || p.startsWith(path + '/'); }).length;
   }
 
   function isStored(path) { return storedFolders.some(function(f) { return f.path === path; }); }
 
   // ── Tree ───────────────────────────────────────────────────────────
-  function renderCloudBar() {
-    var bar = document.getElementById('vmf-cloud-bar');
-    if (!bar) return;
-    var clouds = {};
-    allVms.forEach(function(vm){ if(vm.cloudName) clouds[vm.cloudName]=true; });
-    var names = Object.keys(clouds).sort();
-    if (names.length <= 1) { bar.style.display='none'; return; }
-    bar.style.display='flex';
-    bar.innerHTML='';
-    function makeCtab(cloud, label) {
-      var btn = document.createElement('button');
-      btn.style.cssText = ctabStyle(cloudFilter===cloud);
-      btn.textContent = label;
-      btn.addEventListener('click', function(e) {
-        e.stopPropagation();
-        cloudFilter = cloud;
-        window.vmfContextCloud = cloud==='__all__' ? null : cloud;
-        renderCloudBar(); renderTree(); renderVms();
-      });
-      bar.appendChild(btn);
-    }
-    makeCtab('__all__', 'All');
-    names.forEach(function(c){ makeCtab(c, c); });
-  }
-
-  function ctabStyle(active) {
-    return 'padding:2px 8px;border-radius:10px;font-size:11px;font-weight:'+(active?'600':'400')+';cursor:pointer;border:1px solid '+(active?'var(--hpe-green-dark,#008567)':'var(--hpe-border,#CCCCCC)')+';background:'+(active?'var(--hpe-green,#01A982)':'transparent')+';color:'+(active?'#fff':'var(--hpe-muted,#767676)')+';font-family:-apple-system,sans-serif;white-space:nowrap;line-height:1.4;';
-  }
-
   function renderTree() {
     var paths = allPaths();
     var html = treeItem('__all__', '&#128196;', 'All VMs', allVms.length, 0, null, false);
@@ -235,7 +90,7 @@
     var cls = 'vmf-fi' + (active ? ' active' : '');
     var style = indent ? ' style="padding-left:' + (14 + indent) + 'px"' : '';
     var title = fullPath ? ' title="' + esc(fullPath) + '"' : '';
-    var actions = (!window.vmfReadOnly && stored) ? '<div class="vmf-fi-actions">' +
+    var actions = stored ? '<div class="vmf-fi-actions">' +
       '<button class="vmf-fi-btn" data-rename="' + esc(key) + '" title="Rename">&#9998;</button>' +
       '<button class="vmf-fi-btn del" data-delfolder="' + esc(key) + '" title="Delete">&#10006;</button>' +
       '</div>' : '';
@@ -247,9 +102,6 @@
   }
 
   document.addEventListener('click', function(e) {
-    var act = e.target.closest('[data-actid]');
-    if (act) { e.stopPropagation(); vmfShowActions(parseInt(act.getAttribute('data-actid')), act); return; }
-
     var ren = e.target.closest('[data-rename]');
     var del = e.target.closest('[data-delfolder]');
     var fi  = e.target.closest('[data-folder-key]');
@@ -257,18 +109,12 @@
     if (del) { e.stopPropagation(); vmfDeleteFolder(del.getAttribute('data-delfolder')); return; }
     if (fi)  vmfSelectFolder(fi.getAttribute('data-folder-key'));
   });
-  document.addEventListener('change', function(e) {
-    if (e.target && e.target.id === 'vmf-cloud-filter') { cloudFilter = e.target.value; renderVms(); }
-  });
 
   // ── VM table ───────────────────────────────────────────────────────
   function getFiltered() {
     var vms = activeFolder === '__all__' ? allVms.slice() :
               activeFolder === ROOT ? allVms.filter(function(vm) { return getVmFolder(vm) === ROOT; }) :
               allVms.filter(function(vm) { var p = getVmFolder(vm); return p === activeFolder || p.startsWith(activeFolder + '/'); });
-    var ac = (cloudFilter !== '__all__') ? cloudFilter : (window.vmfContextCloud || null);
-    if (ac) vms = vms.filter(function(vm){ return (vm.cloudName||'') === ac; });
-    if (window.vmfHostId) vms = vms.filter(function(vm){ return String(vm.hostId||'') === String(window.vmfHostId); });
     if (searchQ) {
       var q = searchQ.toLowerCase();
       vms = vms.filter(function(vm) {
@@ -316,17 +162,17 @@
         '<td><input type="checkbox" class="vmf-cb" data-id="'+id+'"'+(sel?' checked':'')+' ></td>' +
         '<td class="vmft-name"><a href="/infrastructure/servers/'+id+'" target="_blank">'+esc(vm.name||'VM-'+id)+'</a></td>' +
         '<td>'+dot(vm.powerState)+'<span style="vertical-align:middle">'+esc(statusStr)+'</span></td>' +
-        '<td>'+esc((function(o){return(!o||o.includes('@')||o.includes('morpheus'))?'—':o;})(vm.osType))+'</td>' +
+        '<td>'+esc(vm.osType||'—')+'</td>' +
         '<td>'+fmtMem(vm.maxMemory)+'</td>' +
         '<td>'+(vm.maxCores||'—')+'</td>' +
         '<td>'+esc(ip)+'</td>' +
         '<td>'+esc(vm.cloudName||'—')+'</td>' +
         '<td>'+folderLabel+'</td>' +
         '<td><div style="display:flex;gap:3px;flex-wrap:wrap">' +
-        (!window.vmfReadOnly ? '<button class="vmf-act vmf-move-btn" data-id="'+id+'">Move</button>' : '') +
+        '<button class="vmf-act vmf-move-btn" data-id="'+id+'">Move</button>' +
         '<a class="vmf-act vmf-act-console" href="/terminal/server/'+id+'?consoleMode=hypervisor" target="_blank" title="Open console">&#9654;</a>' +
-        (isOn ? '<button class="vmf-act vmf-pw-btn vmf-stop-btn" data-id="'+id+'" data-action="stop" title="Stop VM">&#9632; Stop</button>' : '<button class="vmf-act vmf-pw-btn vmf-start-btn" data-id="'+id+'" data-action="start" title="Start VM">&#9654; Start</button>') +
-        (!window.vmfReadOnly && fp!==ROOT ? '<button class="vmf-act vmf-act-x vmf-rm-btn" data-id="'+id+'" title="Remove from folder">&#10006;</button>' : '') +
+        (isOn ? '<button class="vmf-act vmf-pw-btn" data-id="'+id+'" data-action="stop" title="Stop VM" style="color:#c00">&#9632; Stop</button>' : '<button class="vmf-act vmf-pw-btn" data-id="'+id+'" data-action="start" title="Start VM" style="color:#01A982">&#9654; Start</button>') +
+        (fp!==ROOT ? '<button class="vmf-act vmf-act-x vmf-rm-btn" data-id="'+id+'" title="Remove from folder">&#10006;</button>' : '') +
         '</div></td></tr>';
     });
     html += '</tbody></table>';
@@ -358,7 +204,6 @@
 
   // ── Public ─────────────────────────────────────────────────────────
   window.vmfReload = async function() {
-    syncDarkMode();
     setStatus('Loading...');
     var fl=document.getElementById('vmf-flist'), vl=document.getElementById('vmf-vlist');
     if(fl) fl.innerHTML='<div class="vmf-spin"><div class="vmf-spinner"></div>Loading...</div>';
@@ -366,11 +211,7 @@
     selectedIds.clear(); updateMvBtn();
     try {
       await fetchAll();
-      // Auto-detect cloud from context set by HBS template (DOM-read synchronously)
-      if (cloudFilter === '__all__' && window.vmfContextCloud) {
-        cloudFilter = window.vmfContextCloud;
-      }
-      renderCloudBar(); renderTree(); renderVms();
+      renderTree(); renderVms();
       setStatus(allVms.length+' VMs loaded');
     } catch(e) {
       if(vl) vl.innerHTML='<div class="vmf-empty"><div class="vmf-empty-icon">&#9888;</div><div style="color:#c00">Error: '+esc(e.message)+'</div></div>';
@@ -578,113 +419,6 @@
       document.body.removeChild(a); URL.revokeObjectURL(url);
       vmfToast('Logs exported ('+d.lineCount+' lines)');
     } catch(e) { vmfToast('Export error: '+e.message, true); }
-  };
-
-
-  // ── Server Actions dropdown ──────────────────────────────────────────
-  window.vmfShowActions = async function(id, btn) {
-    document.querySelectorAll('.vmf-act-dd').forEach(function(d){ d.remove(); });
-    var vm = allVms.find(function(v){return v.id===id;});
-    var isOn = vm && String(vm.powerState||'').toLowerCase().match(/on|running/);
-    var dd = document.createElement('div');
-    dd.className = 'vmf-act-dd';
-    // Use fixed positioning so overflow:hidden on scroll containers doesn't clip
-    document.body.appendChild(dd);
-    dd.style.cssText = 'position:fixed;background:#fff;border:1px solid #CCCCCC;border-radius:4px;box-shadow:0 4px 16px rgba(0,0,0,.2);z-index:99999;min-width:190px;overflow:hidden;';
-    var br = btn.getBoundingClientRect();
-    var left = br.right - 190;
-    if (left < 4) left = 4;
-    var top = br.bottom + 2;
-    dd.style.left = left + 'px';
-    dd.style.top = top + 'px';
-    // Flip upward if near bottom
-    setTimeout(function(){
-      var dr = dd.getBoundingClientRect();
-      if (dr.bottom > window.innerHeight - 8) {
-        dd.style.top = (br.top - dr.height - 2) + 'px';
-      }
-    }, 0);
-    var actions = [
-      {label:'&#9654; Open Console',fn:function(){window.open('/terminal/server/'+id+'?consoleMode=hypervisor','_blank');dd.remove();}},
-    ];
-    if (!isOn) actions.push({label:'&#9654; Start',   fn:function(){openConfirm('Start VM','Start "'+(vm&&vm.name||'VM')+'"?',function(){vmfPower(id,'start');});dd.remove();}});
-    if (isOn)  actions.push({label:'&#9632; Stop',    fn:function(){openConfirm('Stop VM', 'Stop "' +(vm&&vm.name||'VM')+'"?',function(){vmfPower(id,'stop');});dd.remove();}});
-
-    actions.push({divider:true});
-    actions.push({label:'&#128279; Open in Morpheus',fn:function(){window.open('/infrastructure/servers/'+id,'_blank');dd.remove();}});
-    try {
-      var r=await fetch('/plugin/vmFolders/serverActions?vmId='+id);
-      if(r.ok){var d=await r.json();if(d.actions&&d.actions.length){actions.push({divider:true});d.actions.forEach(function(a){if(['start','stop'].includes((a.code||'').toLowerCase()))return;actions.push({label:'&#9881; '+a.name,fn:(function(ac,an,au){return function(){
-              if(au){window.open(au,'_blank');dd.remove();return;}
-              fetch('/plugin/vmFolders/executeAction?vmId='+id+'&action='+encodeURIComponent(ac),{method:'POST'})
-                .then(function(res){return res.json();})
-                .then(function(res){vmfToast(res.success?an+' sent':'Failed: '+(res.error||''),!res.success);})
-                .catch(function(e){vmfToast('Error: '+e.message,true);});
-              dd.remove();};})(a.code,a.name,a.url||null)});});}}
-    } catch(e){}
-    dd.innerHTML='';
-    actions.forEach(function(a){
-      if(a.divider){var s=document.createElement('div');s.style.cssText='height:1px;background:#f0f0f0;margin:2px 0;';dd.appendChild(s);return;}
-      var item=document.createElement('button');
-      item.style.cssText='display:block;width:100%;text-align:left;padding:7px 14px;font-size:12px;font-family:-apple-system,sans-serif;background:none;border:none;cursor:pointer;color:#333;white-space:nowrap;';
-      item.innerHTML=a.label;
-      item.addEventListener('mouseenter',function(){this.classList.add('vmf-dd-on');});
-      item.addEventListener('mouseleave',function(){this.classList.remove('vmf-dd-on');});
-      item.addEventListener('click',a.fn);
-      dd.appendChild(item);
-    });
-    setTimeout(function(){document.addEventListener('click',function cls(e){if(!dd.contains(e.target)&&e.target!==btn){dd.remove();document.removeEventListener('click',cls);}});},0);
-  };
-
-  // ── Compute tab overlay (React-safe full-screen panel) ───────────────
-  window.vmfShowOverlay = function() {
-    var ov=document.getElementById('vmf-overlay');
-    if(!ov){
-      ov=document.createElement('div');ov.id='vmf-overlay';
-      ov.style.cssText='position:fixed;inset:0;background:#F5F5F5;z-index:9000;display:flex;flex-direction:column;overflow:hidden;';
-      var hdr=document.createElement('div');
-      hdr.style.cssText='display:flex;align-items:center;gap:8px;padding:0 16px;height:44px;background:#425563;color:#fff;flex-shrink:0;';
-      hdr.innerHTML='<span style="display:flex;align-items:center;gap:6px;font-size:14px;font-weight:600;"><span style="display:inline-block;width:3px;height:16px;background:#01A982;border-radius:2px;"></span>VM Folders</span>'+
-        '<button id="vmf-ov-organize" style="margin-left:auto;padding:4px 10px;border-radius:4px;font-size:11px;border:1px solid rgba(255,255,255,.4);background:transparent;color:#fff;cursor:pointer;">&#9881; Auto-Organize</button>'+
-        '<button id="vmf-ov-close" style="background:none;border:none;color:#fff;font-size:20px;cursor:pointer;opacity:.7;padding:0 4px;">&#215;</button>';
-      ov.appendChild(hdr);
-      var panel=document.createElement('div');panel.style.cssText='flex:1;overflow:hidden;display:flex;flex-direction:column;';
-      panel.innerHTML=buildPanelHTML();ov.appendChild(panel);
-      document.body.appendChild(ov);buildModal();buildToast();
-      document.getElementById('vmf-ov-close').addEventListener('click',function(){ov.style.display='none';});
-      document.getElementById('vmf-ov-organize').addEventListener('click',function(){if(typeof vmfAutoOrganize==='function')vmfAutoOrganize();});
-    } else { ov.style.display='flex'; }
-    syncDarkMode();
-    setTimeout(vmfReload,150);
-  };
-
-  // ── Auto-organize: Cloud/Host hierarchy ──────────────────────────────
-  window.vmfAutoOrganize = function() {
-    openConfirm('Auto-Organize VMs','Create Cloud/Host folders and assign all VMs. Existing assignments will be updated.',async function(){
-      setStatus('Auto-organizing...');
-      var folders={},assignments={};
-      allVms.forEach(function(vm){
-        var cloud=(vm.cloudName||'Unknown').replace(/[/]/g,'-');
-        var host=(vm.hostName||'Unknown Host').replace(/[/]/g,'-');
-        folders['/'+cloud]=true; folders['/'+cloud+'/'+host]=true;
-        assignments[vm.id]='/'+cloud+'/'+host;
-      });
-      for(var fp of Object.keys(folders).sort()) await get('/saveFolder?path='+encodeURIComponent(fp));
-      for(var vid of Object.keys(assignments)) await get('/assign?vmId='+vid+'&path='+encodeURIComponent(assignments[vid]));
-      await fetchAll();renderTree();vmfSelectFolder('__all__');
-      vmfToast('Auto-organized '+allVms.length+' VMs');
-    });
-  };
-
-  // ── Re-sync host assignments (VME auto-migration) ────────────────────
-  window.vmfResyncHosts = async function() {
-    openConfirm('Re-sync Host Assignments','Update VMs in Cloud/Host folders to reflect current host locations.',async function(){
-      setStatus('Re-syncing...');
-      var r=await fetch('/plugin/vmFolders/resync');
-      var d=await r.json();
-      vmfToast(d.success?(d.moved>0?'Re-synced '+d.moved+' VM(s)':'All VMs already current'):'Re-sync failed: '+d.error,!d.success);
-      if(d.success&&d.moved>0){await fetchAll();renderTree();renderVms();}
-    });
   };
 
   function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}

@@ -1,0 +1,86 @@
+<style nonce="{{nonce}}">
+  #vmf-ct * { box-sizing:border-box; }
+  #vmf-ct { padding:0; background:var(--hpe-bg,#F5F5F5); min-height:500px; display:flex; flex-direction:column; }
+  #vmf-ct-hdr { display:flex; align-items:center; gap:8px; padding:10px 16px; background:var(--hpe-header,#425563); color:#fff; flex-shrink:0; }
+  #vmf-ct-hdr span.title { font-size:14px; font-weight:600; display:flex; align-items:center; gap:6px; font-family:-apple-system,sans-serif; }
+  #vmf-ct-hdr span.title::before { content:''; display:inline-block; width:3px; height:16px; background:#01A982; border-radius:2px; }
+  .vmf-cl-btn { padding:4px 10px; border-radius:4px !important; font-size:11px; cursor:pointer; border:1px solid rgba(255,255,255,.4) !important; background:transparent !important; color:#fff !important; text-decoration:none; display:inline-block; font-family:-apple-system,sans-serif; }
+  .vmf-cl-btn:hover { border-color:#fff !important; background:rgba(255,255,255,.1) !important; }
+  #vmf-ct .vmf-main { display:flex; flex:1; overflow:hidden; min-height:420px; }
+  #vmf-ct #vmf-cloud-bar { display:flex; flex-wrap:wrap; gap:3px; padding:6px 10px; background:var(--hpe-bg,#F5F5F5); border-bottom:1px solid var(--hpe-border,#CCCCCC); flex-shrink:0; }
+  #vmf-ct #vmf-tree { width:190px; background:var(--hpe-white,#fff); border-right:1px solid var(--hpe-border,#CCCCCC); display:flex; flex-direction:column; overflow:hidden; flex-shrink:0; }
+  #vmf-ct #vmf-tree-head { padding:8px 12px; font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:.07em; color:var(--hpe-muted,#767676); background:var(--hpe-bg,#F5F5F5); border-bottom:1px solid var(--hpe-border,#CCCCCC); }
+  #vmf-ct #vmf-flist { flex:1; overflow-y:auto; padding:3px 0; }
+  #vmf-ct .vmf-fi { display:flex; align-items:center; gap:6px; padding:5px 12px; cursor:pointer; border-left:3px solid transparent; font-size:12px; font-family:-apple-system,sans-serif; color:var(--hpe-text,#333); }
+  #vmf-ct .vmf-fi:hover { background:var(--hpe-row-hover,#F9FAFA); }
+  #vmf-ct .vmf-fi.active { background:var(--hpe-selected,#E6F5F1); border-left-color:#01A982; color:#008567; font-weight:600; }
+  #vmf-ct .vmf-fi-icon { font-size:12px; flex-shrink:0; }
+  #vmf-ct .vmf-fi-name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #vmf-ct .vmf-fi-count { font-size:10px; background:var(--hpe-border,#eee); color:var(--hpe-muted,#767676); border-radius:8px; padding:0 5px; flex-shrink:0; }
+  #vmf-ct .vmf-fi.active .vmf-fi-count { background:#c8ede4; color:#008567; }
+  #vmf-ct .vmf-divider { height:1px; background:var(--hpe-border,#CCCCCC); margin:2px 0; opacity:.5; }
+  #vmf-ct #vmf-content { flex:1; display:flex; flex-direction:column; overflow:hidden; }
+  #vmf-ct #vmf-toolbar { display:flex; align-items:center; gap:6px; padding:7px 12px; background:var(--hpe-white,#fff); border-bottom:1px solid var(--hpe-border,#CCCCCC); flex-shrink:0; flex-wrap:wrap; }
+  #vmf-ct #vmf-search { padding:4px 8px; border:1px solid var(--hpe-border,#CCCCCC); border-radius:4px !important; font-size:12px; max-width:200px; background:var(--hpe-white,#fff); color:var(--hpe-text,#333); }
+  #vmf-ct #vmf-search:focus { outline:none; border-color:#01A982; }
+  #vmf-ct #vmf-bc { font-size:11px; color:var(--hpe-muted,#767676); font-family:-apple-system,sans-serif; }
+  #vmf-ct #vmf-vlist { flex:1; overflow-y:auto; background:var(--hpe-white,#fff); }
+  #vmf-ct #vmf-status { padding:4px 12px; background:var(--hpe-bg,#F5F5F5); border-top:1px solid var(--hpe-border,#CCCCCC); font-size:10px; color:var(--hpe-muted,#767676); font-family:-apple-system,sans-serif; }
+  #vmf-ct table.vmft { width:100%; border-collapse:collapse; background:var(--hpe-white,#fff); }
+  #vmf-ct table.vmft thead th { position:sticky; top:0; background:var(--hpe-bg,#F5F5F5); border-bottom:2px solid var(--hpe-border,#CCCCCC); padding:6px 8px; text-align:left; font-weight:600; font-size:10px; text-transform:uppercase; color:var(--hpe-muted,#767676); white-space:nowrap; cursor:pointer; font-family:-apple-system,sans-serif; }
+  #vmf-ct table.vmft tbody tr { border-bottom:1px solid var(--hpe-border,#f0f0f0); }
+  #vmf-ct table.vmft tbody tr:hover { background:var(--hpe-row-hover,#F9FAFA); }
+  #vmf-ct table.vmft td { padding:5px 8px; font-size:11px; font-family:-apple-system,sans-serif; vertical-align:middle; color:var(--hpe-text,#333); }
+  #vmf-ct .vmft-name a { color:#008567; text-decoration:none; font-weight:500; }
+  #vmf-ct .vmft-name a:hover { text-decoration:underline; }
+  #vmf-ct .vmf-dot { display:inline-block; width:6px; height:6px; border-radius:50%; margin-right:3px; vertical-align:middle; }
+  #vmf-ct .vmf-tag { background:var(--hpe-selected,#e6f5f1); color:#008567; border-radius:3px; padding:1px 6px; font-size:10px; font-weight:500; border:1px solid #b3e0d5; }
+  #vmf-ct .vmf-act { padding:2px 7px !important; font-size:11px !important; border:1px solid var(--hpe-border,#CCCCCC) !important; border-radius:3px !important; background:var(--hpe-white,#fff) !important; cursor:pointer !important; color:var(--hpe-text,#333) !important; font-family:-apple-system,sans-serif !important; line-height:1.4 !important; min-height:0 !important; height:auto !important; }
+  #vmf-ct .vmf-act:hover { border-color:#01A982 !important; color:#008567 !important; }
+  #vmf-ct .vmf-pw-btn { color:#fff !important; }
+  #vmf-ct .vmf-empty, #vmf-ct .vmf-spin { display:flex; align-items:center; justify-content:center; padding:30px; color:var(--hpe-muted,#767676); font-family:-apple-system,sans-serif; gap:8px; font-size:12px; }
+  #vmf-ct .vmf-spinner { width:14px; height:14px; border:2px solid var(--hpe-border,#CCCCCC); border-top-color:#01A982; border-radius:50%; animation:vmfCtSpin .7s linear infinite; }
+  @keyframes vmfCtSpin { to { transform:rotate(360deg); } }
+</style>
+
+<div id="vmf-ct">
+  <div id="vmf-ct-hdr">
+    <span class="title">VM Folders</span>
+    <span style="font-size:11px;color:#B0BEC5;">{{object.serverName}}</span>
+    <a href="/plugin/vmFolders" target="_blank" class="vmf-cl-btn" style="margin-left:auto;">Open Full View ↗</a>
+  </div>
+  <div class="vmf-main">
+    <div id="vmf-tree">
+      <div id="vmf-cloud-bar"></div>
+      <div id="vmf-tree-head">Folders</div>
+      <div id="vmf-flist"><div class="vmf-spin"><div class="vmf-spinner"></div>Loading...</div></div>
+    </div>
+    <div id="vmf-content">
+      <div id="vmf-toolbar">
+        <input id="vmf-search" type="text" placeholder="Search VMs...">
+        <span id="vmf-bc">&#128193; <b>All VMs</b></span>
+      </div>
+      <div id="vmf-vlist"><div class="vmf-spin"><div class="vmf-spinner"></div>Loading VMs...</div></div>
+      <div id="vmf-status">Loading...</div>
+    </div>
+  </div>
+</div>
+
+<script nonce="{{nonce}}">
+  window.vmfReadOnly = true;
+  window.vmfContextCloud = '{{object.cloudName}}';
+  (function() {
+    // Rename wrapper to expected ID
+    var wrap = document.getElementById('vmf-ct');
+    if (wrap) wrap.id = 'vmf-cluster-tab-wrap';
+    if (typeof vmfReload === 'function') {
+      vmfReload();
+    } else {
+      var s = document.createElement('script');
+      s.src = '/assets/plugin/vm-folders/vmFolders.js';
+      s.nonce = '{{nonce}}';
+      s.onload = function() { if (typeof vmfReload === 'function') vmfReload(); };
+      document.head.appendChild(s);
+    }
+  })();
+</script>

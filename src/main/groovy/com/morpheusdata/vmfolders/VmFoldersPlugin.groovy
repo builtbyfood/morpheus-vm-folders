@@ -7,29 +7,26 @@ import groovy.util.logging.Slf4j
 @Slf4j
 class VmFoldersPlugin extends Plugin {
 
-    // Init block runs before registerPlugin — sets renderer to prevent
-    // DynamicTemplateLoader immutable list crash in HPE VME Morpheus 8.1.x
-    {
-        this.renderer = new HandlebarsRenderer()
-    }
-
     @Override
     String getCode() { return 'vm-folders-plugin' }
 
     @Override
     void initialize() {
+        this.renderer = new HandlebarsRenderer()
+
         this.name        = 'VM Folders'
-        this.description = 'VM Folder organization for HPE VM Essentials'
+        this.description = 'vCenter-style folder organization for VMs in HPE Morpheus'
         this.author      = 'Travis DeLuca'
-        this.version     = '1.0.0'
+        this.version     = '1.1.0'
 
-        VmFoldersNavProvider navProvider = new VmFoldersNavProvider(this, morpheus)
-        registerProvider(navProvider)
+        this.controllers.add(new VmFoldersController(this, morpheus))
 
-        VmFoldersController controller = new VmFoldersController(this, morpheus)
-        setControllers([controller])
+        registerProvider(new VmFoldersNavProvider(this, morpheus))
+        registerProvider(new VmFoldersClusterTabProvider(this, morpheus))
+        registerProvider(new VmFoldersServerTabProvider(this, morpheus))
+        registerProvider(new VmFoldersInstanceTabProvider(this, morpheus))
 
-        log.info("VM Folders Plugin initialized")
+        log.info("VM Folders Plugin v1.1.0 initialized")
     }
 
     Boolean hasCustomRenderer() { return true }

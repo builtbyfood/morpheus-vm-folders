@@ -26,7 +26,6 @@ class VmFoldersController implements PluginController {
 
     static final String DATA_DIR  = '/var/opt/morpheus/morpheus-ui/plugins'
     static final String DB_FILE   = "${DATA_DIR}/vm-folders.json"
-    static final String VERSION   = '1.1.0'
     static final String BAK_FILE  = "${DATA_DIR}/vm-folders.json.bak"
 
     VmFoldersController(Plugin plugin, MorpheusContext morpheusContext) {
@@ -55,10 +54,7 @@ class VmFoldersController implements PluginController {
             p("/vmFolders/backup",    "backup"),
             p("/vmFolders/restore",   "restore"),
             p("/vmFolders/export",    "export"),
-            p("/vmFolders/power",          "power"),
-            p("/vmFolders/serverActions",   "serverActions"),
-            p("/vmFolders/executeAction",   "executeAction"),
-            p("/vmFolders/resync",          "resync"),
+            p("/vmFolders/power",     "power"),
             p("/vmFolders/logs",      "logs")
         ]
     }
@@ -121,10 +117,7 @@ class VmFoldersController implements PluginController {
                 def ps = s.powerState
                 def powerState = ps ? ps.toString() : (s.status ? s.status.toString() : 'unknown')
                 def osType = ''
-                try {
-                    def osRaw = (s.osType instanceof String ? s.osType : s.osType?.name) ?: (s.serverOs instanceof String ? s.serverOs : s.serverOs?.name) ?: ''
-                    osType = (osRaw.contains('@') || osRaw.contains('com.morpheus')) ? '' : osRaw
-                } catch(ex) {}
+                try { osType = (s.osType instanceof String ? s.osType : s.osType?.name) ?: (s.serverOs instanceof String ? s.serverOs : s.serverOs?.name) ?: '' } catch(ex) {}
                 def cloudName = ''
                 try { cloudName = (s.cloud instanceof String ? s.cloud : s.cloud?.name) ?: '' } catch(ex) {}
 
@@ -136,9 +129,6 @@ class VmFoldersController implements PluginController {
                     internalIp : s.internalIp ?: '',
                     hostname   : s.hostname ?: '',
                     osType     : osType,
-                    hostId     : s.parentServer?.id?.toString() ?: '',
-                    hostName   : (s.parentServer?.name instanceof String ? s.parentServer?.name : s.parentServer?.name?.toString()) ?: '',
-                    hostIp     : s.parentServer?.sshHost ?: s.parentServer?.externalIp ?: '',
                     maxMemory  : s.maxMemory ?: 0,
                     maxCores   : s.maxCores ?: 0,
                     cloudName  : cloudName,
@@ -486,10 +476,6 @@ class VmFoldersController implements PluginController {
     .vmf-act-x { border-color:transparent; color:var(--hpe-muted); }
     .vmf-act-x:hover { border-color:#c00; color:#c00; background:#fff5f5; }
     .vmf-act-console { background:var(--hpe-green); border-color:var(--hpe-green-dark); color:#fff; }
-    .vmf-start-btn { background:#01A982 !important; border-color:#008567 !important; color:#fff !important; }
-    .vmf-stop-btn  { background:#c00    !important; border-color:#a00    !important; color:#fff !important; }
-    .vmf-start-btn:hover { background:#008567 !important; }
-    .vmf-stop-btn:hover  { background:#a00    !important; }
     .vmf-act-console:hover { background:var(--hpe-green-dark); color:#fff; }
     .vmf-pw-on { color:var(--hpe-green); }
     .vmf-pw-off { color:#c00; }
@@ -533,7 +519,6 @@ class VmFoldersController implements PluginController {
   </div>
   <div id="vmf-main">
     <div id="vmf-tree">
-      <div id="vmf-cloud-bar" style="display:flex;flex-wrap:nowrap;gap:4px;padding:5px 10px;background:var(--hpe-bg);border-bottom:1px solid var(--hpe-border);flex-shrink:0;overflow-x:auto;align-items:center;"></div>
       <div id="vmf-tree-head">Folders</div>
       <div id="vmf-flist"><div class="vmf-spin"><div class="vmf-spinner"></div>Loading...</div></div>
     </div>
@@ -595,81 +580,4 @@ class VmFoldersController implements PluginController {
 </body>
 </html>"""
     }
-
-    // ── API: server actions (proxy to Morpheus) ──────────────────────
-    def serverActions(ViewModel<Map> model) {
-        try {
-            def vmId = model?.request?.getParameter('vmId') as Long
-            if (!vmId) return JsonResponse.of([success:false, error:'vmId required'])
-            def server = morpheusContext.services.computeServer.get(vmId)
-            if (!server) return JsonResponse.of([success:false, error:'Server not found'])
-            // Build standard action list based on server type and state
-            def ps = server.powerState?.toString()?.toLowerCase() ?: 'unknown'
-            def isOn = ps.matches('.*on.*|.*running.*')
-            def actions = []
-            if (isOn)  actions << [code:'restart', name:'Restart']
-            // Simplified — Console/Start/Stop/Restart handled client-side
-            // Add extra actions here in future if needed
-            return JsonResponse.of([success:true, actions:actions])
-        } catch(e) {
-            log.error("serverActions error: ${e.message}", e)
-            return JsonResponse.of([success:false, error:e.message, actions:[]])
-        }
-    }
-
-    // ── API: execute server action ────────────────────────────────────
-    def executeAction(ViewModel<Map> model) {
-        try {
-            def vmId   = model?.request?.getParameter('vmId') as Long
-            def action = model?.request?.getParameter('action') ?: ''
-            if (!vmId || !action) return JsonResponse.of([success:false, error:'vmId and action required'])
-            switch(action) {
-                case 'restart':
-                    def result = morpheusContext.services.computeServer.restartServer(vmId)
-                    return JsonResponse.of([success:result, action:action])
-                default:
-                    return JsonResponse.of([success:false, error:"Action '${action}' not implemented via plugin. Use Morpheus UI for workflows/tasks."])
-            }
-        } catch(e) {
-            log.error("executeAction error: ${e.message}", e)
-            return JsonResponse.of([success:false, error:e.message])
-        }
-    }
-
-    // ── API: resync host assignments for auto-migrated VMs ────────────
-    def resync(ViewModel<Map> model) {
-        try {
-            def db = readDb()
-            def assignments = db.assignments as Map ?: [:]
-            def servers = morpheusContext.services.computeServer.list(
-                new com.morpheusdata.core.data.DataQuery().withFilter(
-                    new com.morpheusdata.core.data.DataFilter('vmHypervisor', false)))
-            def moved = 0
-            servers.each { s ->
-                def vid = s.id?.toString()
-                def currentPath = assignments[vid]
-                if (!currentPath || currentPath == '/') return
-                def segments = currentPath.split('/').findAll { it }
-                if (segments.size() < 2) return
-                // Only update if this looks like an auto-organized path (cloud/host)
-                def hostName = (s.parentServer?.name instanceof String ? s.parentServer?.name : s.parentServer?.name?.toString()) ?: ''
-                def cloudName = (s.cloud instanceof String ? s.cloud : s.cloud?.name?.toString()) ?: ''
-                if (!hostName || !cloudName) return
-                def expectedPath = '/' + cloudName.replace('/', '-') + '/' + hostName.replace('/', '-')
-                if (currentPath != expectedPath) {
-                    assignments[vid] = expectedPath
-                    moved++
-                }
-            }
-            if (moved > 0) {
-                db.assignments = assignments
-                writeDb(db)
-            }
-            return JsonResponse.of([success:true, moved:moved, message:"Re-synced ${moved} VM(s)"])
-        } catch(e) {
-            log.error("resync error: ${e.message}", e)
-            return JsonResponse.of([success:false, error:e.message])
-        }
-    }
-
 }

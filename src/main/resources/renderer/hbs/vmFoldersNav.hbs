@@ -1,0 +1,25 @@
+<script nonce="{{nonce}}" src="/assets/plugin/vm-folders/vmFolders.js"></script>
+<style nonce="{{nonce}}">
+  /* CSS variables — applied on every Morpheus page so tabs inherit them */
+  :root {
+    --hpe-green: #01A982; --hpe-green-dark: #008567;
+    --hpe-header: #425563; --hpe-bg: #F5F5F5;
+    --hpe-white: #FFFFFF; --hpe-border: #CCCCCC;
+    --hpe-text: #333333; --hpe-muted: #767676;
+    --hpe-selected: #E6F5F1; --hpe-row-hover: #F9FAFA;
+  }
+  body.dark {
+    --hpe-bg: #1A1F2B; --hpe-white: #242B38;
+    --hpe-border: #3A4458; --hpe-text: #E0E6F0;
+    --hpe-muted: #8899B0; --hpe-selected: #1A3A30;
+    --hpe-row-hover: #1E2535; --hpe-header: #2C3547;
+  }
+  /* Actions dropdown hover */
+  .vmf-dd-on { background: #E6F5F1 !important; color: #008567 !important; }
+  body.dark .vmf-dd-on { background: #1A3A30 !important; color: var(--hpe-green) !important; }
+  /* Cloud tab active */
+  .vmf-ctab-active { background: var(--hpe-green) !important; color: #fff !important; }
+  /* Compute overlay */
+  #vmf-folders { background: var(--hpe-bg) !important; min-height: 500px !important; padding: 0 !important; display: flex; flex-direction: column; }
+  #vmf-folders.tab-pane:not(.active) { display: none !important; }
+</style>

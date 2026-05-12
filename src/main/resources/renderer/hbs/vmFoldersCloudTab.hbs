@@ -1,0 +1,51 @@
+<style nonce="{{nonce}}">
+  #vmf-cloud-wrap { padding:0; background:#F5F5F5; min-height:500px; display:flex; flex-direction:column; }
+  #vmf-cloud-wrap * { box-sizing:border-box; }
+  @keyframes vmfCloudSpin { to { transform:rotate(360deg); } }
+  .vmf-cld-spin { display:flex;align-items:center;justify-content:center;padding:30px;color:#767676;gap:8px;font-size:12px;font-family:-apple-system,sans-serif; }
+  .vmf-cld-spinner { width:14px;height:14px;border:2px solid #CCCCCC;border-top-color:#01A982;border-radius:50%;animation:vmfCloudSpin .7s linear infinite; }
+</style>
+
+<div id="vmf-cloud-wrap">
+  <div style="display:flex;align-items:center;gap:8px;padding:10px 16px;background:#425563;color:#fff;flex-shrink:0;">
+    <span style="display:flex;align-items:center;gap:6px;font-size:14px;font-weight:600;font-family:-apple-system,sans-serif;">
+      <span style="display:inline-block;width:3px;height:16px;background:#01A982;border-radius:2px;"></span>
+      VM Folders
+    </span>
+    <span style="font-size:11px;color:#B0BEC5;">{{object.cloudName}}</span>
+    <a href="/plugin/vmFolders" target="_blank"
+       style="margin-left:auto;padding:4px 10px;border-radius:4px;font-size:11px;border:1px solid rgba(255,255,255,.4);background:transparent;color:#fff;text-decoration:none;">
+      Open Full View ↗
+    </a>
+  </div>
+  <div style="display:flex;flex:1;overflow:hidden;min-height:460px;">
+    <div id="vmf-tree" style="width:200px;background:#fff;border-right:1px solid #CCCCCC;display:flex;flex-direction:column;overflow:hidden;flex-shrink:0;">
+      <div id="vmf-tree-head" style="padding:8px 12px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.07em;color:#767676;background:#F5F5F5;border-bottom:1px solid #CCCCCC;">Folders</div>
+      <div id="vmf-flist"><div class="vmf-cld-spin"><div class="vmf-cld-spinner"></div>Loading...</div></div>
+    </div>
+    <div id="vmf-content" style="flex:1;display:flex;flex-direction:column;overflow:hidden;">
+      <div id="vmf-toolbar" style="display:flex;align-items:center;gap:6px;padding:8px 12px;background:#fff;border-bottom:1px solid #CCCCCC;flex-shrink:0;">
+        <input id="vmf-search" type="text" placeholder="Search VMs..." style="flex:1;padding:5px 9px;border:1px solid #CCCCCC;border-radius:4px;font-size:12px;max-width:260px;">
+        <button id="vmf-mv-tab-btn" style="display:none;padding:4px 10px;font-size:11px;border-radius:4px;background:#01A982;border:1px solid #008567;color:#fff;cursor:pointer;font-family:-apple-system,sans-serif;">Move Selected</button>
+      </div>
+      <div id="vmf-vlist" style="flex:1;overflow-y:auto;background:#fff;">
+        <div class="vmf-cld-spin"><div class="vmf-cld-spinner"></div>Loading VMs...</div>
+      </div>
+      <div id="vmf-status" style="padding:5px 12px;background:#F5F5F5;border-top:1px solid #CCCCCC;font-size:11px;color:#767676;font-family:-apple-system,sans-serif;">Loading...</div>
+    </div>
+  </div>
+</div>
+
+<script nonce="{{nonce}}">
+  (function() {
+    if (typeof vmfReload === 'function') {
+      vmfReload();
+    } else {
+      var s = document.createElement('script');
+      s.src = '/assets/plugin/vm-folders/vmFolders.js';
+      s.nonce = '{{nonce}}';
+      s.onload = function() { if (typeof vmfReload === 'function') vmfReload(); };
+      document.head.appendChild(s);
+    }
+  })();
+</script>
