@@ -1,6 +1,6 @@
 # VM Folders — HPE Morpheus Plugin
 
-Folder organization for VMs in HPE Morpheus VM Essentials. Organize, browse, and control virtual machines across clouds without leaving Morpheus.
+Folder organization for VMs in HPE Morpheus VM Essentials. Organize, browse, and control virtual machines across clouds.
 
 ![VM Folders Screenshot](docs/screenshot.png)
 
