@@ -1,6 +1,13 @@
 # VM Folders Plugin for HPE Morpheus VM Essentials
 
-Folder organization for VMs in HPE Morpheus VM Essentials — a vCenter-inspired folder tree that lets you organize, browse, and control virtual machines across clouds without leaving Morpheus.
+<<<<<<< HEAD
+Folder organization for VMs in HPE Morpheus VM Essentials — a folder tree that lets you organize, browse, and control virtual machines across clouds without leaving Morpheus.
+=======
+A VM folder organization plugin for HPE Morpheus.  
+Organize, move, and manage VMs in a persistent folder tree.
+
+![VM Folders Screenshot](docs/screenshot.png)
+>>>>>>> 72fc79a1064e1c864159e4dd483dc491a273e1d1
 
 ---
 
@@ -40,7 +47,77 @@ Folder organization for VMs in HPE Morpheus VM Essentials — a vCenter-inspired
 
 ## Requirements
 
+<<<<<<< HEAD
 | Component | Version |
+=======
+| Morpheus Edition | Tested | Notes |
+|---|---|---|
+| HPE VM Essentials | ✅ | Fully tested |
+| Morpheus Enterprise | ✅ | Fully tested |
+| Morpheus Community | ✅ | Fully tested |
+
+**Minimum Morpheus version:** 8.x  
+**Plugin API version:** 1.3.3
+
+---
+
+## Quick Install (no build required)
+
+1. Download the latest jar from [Releases](https://github.com/builtbyfood/morpheus-vm-folders/releases/latest)
+2. In Morpheus: **Admin → Integrations → Plugins → Upload**
+3. Select the jar file and click Upload
+4. Navigate to: `https://your-morpheus-url/plugin/vmFolders`
+
+That's it. No restart required.
+
+---
+
+## Usage
+
+### Accessing the Plugin
+
+After install, the VM Folders page is available at:
+```
+https://your-morpheus-url/plugin/vmFolders
+```
+
+Bookmark it or add it to your browser favorites.
+
+### Creating Folders
+
+1. Click **+ Folder** in the top right
+2. Enter a path using `/` for nesting — e.g. `/Production/Web`
+3. Click **Create**
+4. The Move dialog opens automatically so you can assign VMs immediately
+
+Folders are persistent — they survive page reloads even with no VMs assigned.
+
+### Moving VMs
+
+**Single VM:** Click the **Move** button on any VM row  
+**Multiple VMs:** Check the checkboxes, then click **Move Selected**  
+**Remove from folder:** Click the **✕** button or Move to Unorganized
+
+### Folder Tree
+
+- Click any folder to filter the VM list to that folder
+- Sub-folders are shown with indentation
+- Click **▼/▶** arrows to collapse/expand folders with children
+- Hover over a folder to reveal **✎ rename** and **✕ delete** buttons
+
+### Power Control
+
+- **▶ Start** / **■ Stop** buttons appear per VM based on current state
+- Power actions use the Morpheus API server-side — no token required
+
+### Console
+
+Click the **▶** console button on any VM to open the hypervisor console in a new tab.
+
+### Backup & Restore
+
+| Button | Action |
+>>>>>>> 72fc79a1064e1c864159e4dd483dc491a273e1d1
 |---|---|
 | HPE Morpheus VM Essentials | 8.1.0+ |
 | Morpheus Appliance | 8.1.x – 8.8.x tested |
@@ -67,8 +144,14 @@ The database file is created automatically at:
 ## Building from Source
 
 ```bash
+<<<<<<< HEAD
 # Prerequisites
 sdk install gradle 7.6.4
+=======
+git clone https://github.com/builtbyfood/morpheus-vm-folders
+cd morpheus-vm-folders-plugin
+
+>>>>>>> 72fc79a1064e1c864159e4dd483dc491a273e1d1
 sdk use gradle 7.6.4
 export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
 
@@ -219,4 +302,9 @@ src/
 
 ## Author
 
+<<<<<<< HEAD
 Travis DeLuca — HPE CloudOps Maestro Expert
+=======
+Travis DeLuca — [@builtbyfood](https://github.com/builtbyfood)  
+Built for the HPE Morpheus community.
+>>>>>>> 72fc79a1064e1c864159e4dd483dc491a273e1d1
