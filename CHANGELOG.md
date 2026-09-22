@@ -1,8 +1,156 @@
 # Changelog
 
-Released versions: **1.0.0**, **1.1.0**, **1.1.5**, **1.2.0**, **1.3.6**.
-Intermediate versions (1.1.1–1.1.4, 1.3.0–1.3.5) were internal builds — several were
+Released versions: **1.0.0**, **1.1.0**, **1.1.5**, **1.2.0**, **1.3.6**, **1.4.1**.
+Intermediate versions (1.1.1–1.1.4, 1.3.0–1.3.5, 1.3.7–1.3.8, 1.4.0) were internal builds — several were
 diagnostic-only — and their net effect is folded into the release that followed them.
+
+## [1.4.1] - 2026-09-22
+
+Follow-up to the first live scans.
+
+### Fixed
+- **Every Morpheus-provisioned volume was listed as orphaned.** On a store holding
+  Morpheus volumes (cargo-bay), all eight uuid files were reported orphaned even though
+  four belong to VMs with disks there. 1.4.0 indexed only the raw values of
+  `volumePath` / `uuid` / `externalId` / `internalId` and looked them up by full path or
+  file name, so any difference in form (path vs. basename, case) missed. The index now
+  holds each identifier **and its basename, lowercased** — including `uniqueId` and
+  `name` — and lookups try both forms. Until confirmed on the appliance, a temporary log
+  line reports what is still unmatched alongside the identifier forms actually stored for
+  volumes on that datastore.
+
+### Added
+- **Disk-only directories** — a third group for directories holding disk-sized files but
+  no libvirt domain XML. They were correct to exclude from "On disk, not in Morpheus"
+  (the rule requires a domain XML) but wrong to bury in Other: a directory with a 30 GB
+  disk and no XML is exactly what an operator needs to see. Expected members on
+  supply-line: `android`, `hellpod`, `gpu-vm`, `manager`, `vme-manager`.
+- **`backup/collection` label** on a VM directory holding more than three domain XMLs, or
+  whose XML names do not match the directory name — `converted/` with 14
+  `ova-test_backup_*.xml` files is a backup dump, not one VM. A label only; the scan
+  cannot know more than that.
+- A note in the Orphaned volumes section that Morpheus virtual images (ISOs such as
+  virtio-win, e.g. the 753 MB `4a08eb13-…` present on both stores) are not
+  `StorageVolume` records and will always appear there.
+
+### Verified in the first live run (1.4.0)
+Scans completed on all three stores; shared stores scanned once on `defender`;
+`ms-dos-6.22` reported 2 disks and 2 XMLs; `photos`, `flightaware` and `veeam` correctly
+matched managed VMs and stayed out of the orphan list. The `homeassistant01test` split —
+2 XMLs and no disks on supply-line, 2 disks and 2 XMLs on cargo-bay — is real: the disks
+live on GFS2 and the NFS copy is XML-only.
+
+## [1.4.0] - 2026-09-22
+
+Datastore scanning: see what is actually on a datastore, not only what Morpheus knows.
+
+**This release can run read-only commands on hypervisor hosts.** It is **off by default**
+and must be enabled by an administrator before any Scan control appears. Disclose this
+surface when reviewing the plugin.
+
+### Added
+- **Datastore scan.** In the datastore view, a Scan button per store lists what is on disk:
+  - **On disk, not in Morpheus** — directories holding a libvirt domain XML whose name
+    matches no VM in the caller's tenant: disk count, total size, XML file names, newest
+    mtime. These can be assigned to folders like any VM.
+  - **Orphaned volumes** — uuid-named files with no matching `StorageVolume`.
+  - **Other files** — everything else, collapsed by default.
+  - Header shows the scanning host and the age of the result, with Rescan.
+- **Scans are manual and cached.** Nothing runs on page load; results are stored in the
+  plugin database under `scans.<datastoreId>` with the timestamp and scanning host, and the
+  view renders the cached result until someone rescans.
+- **On-disk entries can be filed into folders**, keyed `ds:<datastoreId>:<dirname>`. The
+  server validates such a key against the caller's visible datastores and that store's
+  cached scan before writing it, so the strict numeric check on compute-server ids is
+  unchanged.
+- **Plugin setting `Enable datastore scanning`** (checkbox, default off), plus a
+  permission-gated `scanEnable` route as a fallback for appliances where the plugin
+  settings form is unavailable. Both default to off and scanning fails closed if neither
+  can be read.
+
+### Security
+- The scanned path is never client-supplied: it comes from `Datastore.externalPath` and
+  must match `^/mnt/<uuid>$` or `^/var/morpheus/kvm/[a-z0-9-]+$`, or the request is refused
+  with 400 before any command runs. Morpheus-internal stores (`externalId` starting
+  `morpheus-`) and offline stores are not scannable.
+- Commands are fixed templates: a readability test, one bounded `find`
+  (`-maxdepth 2`, regular files only, >1 MB or `*.xml`, no symlink following, no `du`), and
+  a `head -c 512` pass to identify libvirt domain XMLs on the host. 30 s timeout — a store
+  that times out reports a timeout rather than partial data.
+- `/scan` is a mutation and goes through `requireMutation()`; `/scans` and `/scanConfig`
+  are read-only. Results are filtered to datastores the caller can see.
+- Every directory and file name is rendered through `esc()` — these strings come from a
+  filesystem.
+- One audit line per scan: user, datastore, host, elapsed ms, and the counts found.
+
+### Notes
+- Routes are gated on the existing `admin-cm` permission. A plugin-declared
+  `vm-folders-scan` permission was not used because whether Morpheus 9.0.2 honors
+  plugin-declared permissions is still unverified.
+- A store the agent user cannot read is reported per store as *not readable by the agent
+  user (morpheus-node)* rather than as a failed scan: readability depends on the store's
+  ownership and any NFS squash, which vary per deployment.
+
+### Platform facts (9.0.2, verified 2026-09-22)
+- `executeCommandOnServer(server, cmd)` (2-arg) runs through the Morpheus agent in
+  ~50–80 ms. **stdout arrives in `TaskResult.data`; `TaskResult.output` is always null on
+  that path.** The long overloads are not needed.
+- The agent runs commands as `morpheus-node` (uid 996; groups libvirt, kvm, libvirt-qemu).
+- `Datastore.externalPath` holds the path: `/mnt/<uuid>` for NFS and GFS2 stores,
+  `/var/morpheus/kvm/<name>` for host-local directory stores.
+- Shared vs local comes from `datastoreType`: `libvirt-netfs-nfs` and `libvirt-dir-gfs2`
+  are shared (scan once on any host that lists them); `libvirt-dir` is per-host and scanned
+  on its `hostId`. `Datastore.locations` cannot be used for this — it lists every host for
+  every store.
+
+### Removed
+- All 1.3.7/1.3.8 probe code.
+
+## [1.3.8] - 2026-09-22
+
+Second probe build for 1.4.0. **Internal — do not publish.**
+
+### Diagnostics (temporary)
+- **Host exec probe, round 2.** The 2-arg `executeCommandOnServer` returned
+  `success=true exitCode=0` in 54 ms with `output=null` — too fast for SSH, so it ran
+  through the Morpheus agent and stdout is not in `TaskResult.output`. This build runs the
+  same command through four call shapes (2-arg; 10-arg with the position-3 Boolean false
+  and true; 11-arg) and dumps the entire `TaskResult` for each — `output`, `data`,
+  `results`, `customOptions`, `toMap()` and `properties`, with each field's runtime class —
+  plus elapsed ms, to find which shape carries stdout.
+- The command now also performs the read test in the same round trip:
+  `echo vmf-probe && id && ls /mnt && ls -la <nfs path> | head -5`, where `<nfs path>` is
+  taken from the `Datastore.externalPath` of the first mount-based store rather than a
+  literal.
+- The datastore probe is unchanged (its question is answered; kept so one upload re-confirms).
+
+### Note
+The plugin-api jar carries no `MethodParameters`, so the long overloads' parameter *names*
+are unknowable from the jar; position 3 is assumed to be the rpc flag. Every other
+parameter is passed null, and the command is read-only, so a wrong assumption only toggles
+an unintended Boolean.
+
+## [1.3.7] - 2026-09-22
+
+Probe build for the 1.4.0 datastore scan. **Internal — do not publish.**
+
+### Added
+- **Stronger power confirmation for hypervisor hosts.** `/vms` returns `isHost`
+  (`ComputeServerType.vmHypervisor == true`); Stop/Restart on a host row now warns that
+  it is a hypervisor host and that every VM running on it will go down, instead of
+  showing the same dialog as a guest VM.
+
+### Diagnostics (temporary — remove before 1.4.0)
+- **Datastore probe** — logs every visible datastore's `externalPath`, `internalId`,
+  `externalId`, `uniqueId`, `refType`/`refId`, `hostId`, `storageServer`, `zonePool`,
+  `datastoreType`, size/free, and its `locations` (`refType`/`refId`/`refUUID`). Decides
+  the `/mnt/<uuid>` path field and the shared-vs-host-local test.
+- **Host exec probe** — runs `echo vmf-probe && id && ls /mnt` once on a hypervisor host
+  (prefers `defender`) via the 2-arg `executeCommandOnServer`, logging elapsed ms,
+  `success`, `exitCode`, `error`, `msg` and the raw output. Answers whether it
+  authenticates with stored host credentials, which user it runs as, and whether output
+  returns intact.
+- Both run **once per plugin load**, not per request, and the exec probe has a 20 s timeout.
 
 ## [1.3.6] - 2026-09-21
 

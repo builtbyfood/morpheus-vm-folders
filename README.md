@@ -6,7 +6,7 @@ A drop-in plugin that adds a **VM Folders** dashboard to Morpheus plus embedded
 tabs on cluster, host and instance detail pages. No core modifications, no
 Morpheus database schema changes, no appliance restart.
 
-Current version: **1.3.6** · target platform: **Morpheus 9.0.2** · plugin API **1.3.0**
+Current version: **1.4.1** · target platform: **Morpheus 9.0.2** · plugin API **1.3.0**
 
 ## What it does
 
@@ -16,6 +16,9 @@ Current version: **1.3.6** · target platform: **Morpheus 9.0.2** · plugin API 
   Compute → Hosts, and Provisioning → Instances detail pages
 - **Datastore view** — a Datastore column, per-VM disk detail rows, and a
   read-only sidebar section for browsing VMs by the datastore their disks are on
+- **Datastore scanning** (off by default) — lists what is actually on a datastore:
+  VM directories Morpheus does not know about, disk-only directories, orphaned
+  volume files, and other clutter
 - **Auto-Organize** — builds a Cloud/Host folder hierarchy and assigns every VM
 - **Re-sync Hosts** — updates Cloud/Host folder assignments after a live migration
 - **Power actions and console** links inline in the VM table
@@ -52,6 +55,54 @@ Trade-off: because assignments are keyed by compute server id in a plugin-owned
 file, they are not visible to the Morpheus API or to other plugins. Use
 **Export** for an external copy.
 
+## Datastore scanning
+
+**Off by default.** When an administrator enables it, a Scan button appears on each
+scannable datastore in the sidebar. A scan runs three read-only commands on one
+hypervisor host through the Morpheus agent and reports:
+
+| Group | What it means |
+|---|---|
+| **On disk, not in Morpheus** | A directory holding a libvirt domain XML whose name matches no VM in your tenant — imported, migrated or hand-built VMs. These can be filed into folders like any VM. |
+| **Disk-only directories** | Disk-sized files with no domain XML. Not VMs by the detection rule, but worth seeing. |
+| **Orphaned volumes** | uuid-named files with no matching `StorageVolume`. Morpheus *virtual images* (ISOs such as virtio-win) are not StorageVolumes and always appear here. |
+| **Other files** | ISOs, OVAs, zips, backup directories — collapsed by default. |
+
+A directory holding more than three domain XMLs, or XMLs that do not match its name,
+is labelled `backup/collection` rather than treated as one VM.
+
+Scans are **manual only** — nothing runs on page load. Results are cached in the plugin
+database under `scans.<datastoreId>` with the timestamp and scanning host, and the view
+shows the cached result and its age until someone rescans.
+
+### Enabling it
+
+Administration → Plugins → VM Folders → **Enable datastore scanning**. On appliances
+where the plugin settings form is unavailable, a permission-gated route does the same:
+
+```js
+vmfPost('/scanEnable', { enabled: true })   // from the browser console on the dashboard
+```
+
+Both default to off, and scanning fails closed if neither can be read.
+
+### What it runs, and as whom
+
+- A readability test, one bounded `find` (`-maxdepth 2`, regular files only, larger than
+  1 MB or `*.xml`, no symlink following, no `du`), and a `head -c 512` pass to identify
+  libvirt domain XMLs. Nothing is written to the datastore.
+- 30 second timeout — a store that times out reports a timeout, never partial data.
+- Commands run through the Morpheus agent as **`morpheus-node`**. Whether that account can
+  read a given store depends on the store's ownership and any NFS squash, which vary per
+  deployment: a store it cannot read is reported per store as *not readable by the agent
+  user*, not as a failed scan.
+- The scanned path is never client-supplied. It comes from `Datastore.externalPath` and
+  must match `/mnt/<uuid>` or `/var/morpheus/kvm/<name>`; Morpheus-internal stores
+  (`externalId` starting `morpheus-`) and offline stores are never scanned.
+
+Shared stores (`libvirt-netfs-nfs`, `libvirt-dir-gfs2`) are scanned once on any host that
+lists them; host-local stores (`libvirt-dir`) are scanned on their own host.
+
 ## Requirements
 
 | Component | Version |
@@ -69,7 +120,7 @@ No Gradle wrapper is checked in; use a local Gradle 8.x.
 gradle clean shadowJar
 ```
 
-Output: `build/libs/morpheus-vm-folders-plugin-1.3.6-all.jar`
+Output: `build/libs/morpheus-vm-folders-plugin-1.4.1-all.jar`
 
 Morpheus compiles Groovy plugins when it loads them, so a successful Gradle build
 does not prove the plugin compiles against the running appliance. Always check the
@@ -79,7 +130,7 @@ log after uploading:
 sudo grep -i -A15 "VmFolders" /var/log/morpheus/morpheus-ui/current | tail -80
 ```
 
-Expect `VM Folders Plugin 1.3.6 initialized`.
+Expect `VM Folders Plugin 1.4.1 initialized`.
 
 ## Install
 
@@ -105,6 +156,13 @@ Expect `VM Folders Plugin 1.3.6 initialized`.
   page goes through `esc()`. Handlebars templates pass model values via `data-*`
   attributes and never interpolate them into JavaScript string literals.
 
+- **Host commands are fixed templates.** The only value interpolated into a scan command
+  is the datastore path, taken from the platform record and allow-listed by pattern; the
+  request is refused with 400 before any command runs if it does not match. `/scan` is a
+  mutation and passes through `requireMutation()`; `/scans` and `/scanConfig` are
+  read-only and filtered to datastores the caller can see. One audit line is written per
+  scan with user, datastore, host, elapsed time and counts.
+
 Routes are currently gated on the `admin-cm: full` permission. To widen access,
 change the `Permission.build(...)` call in `VmFoldersController.getRoutes()` —
 note that read and write routes presently share one permission.
@@ -129,7 +187,7 @@ src/main/groovy/com/morpheusdata/vmfolders/
   VmFoldersClusterTabProvider.groovy
   VmFoldersServerTabProvider.groovy
   VmFoldersInstanceTabProvider.groovy
-src/assets/javascript/vmFolders.js   SPA: tree, table, datastore view, mutations
+src/assets/javascript/vmFolders.js   SPA: tree, table, datastore view, scan panel, mutations
 src/main/resources/renderer/hbs/     tab templates
 ```
 
@@ -151,10 +209,17 @@ src/main/resources/renderer/hbs/     tab templates
 - **`usedStorage` is reported as 0** by VME/KVM volumes, so disk detail rows show
   `—` for used space.
 - **SPA navigation** does not always reset client state between tabs.
+- **Scanning reads only what the agent user can see** — a store `morpheus-node` cannot
+  read is reported as unreadable rather than scanned.
+- **Scan results are a snapshot**, cached until someone rescans; they do not track
+  changes on the datastore.
+- A plugin-declared `vm-folders-scan` permission is not used, because whether Morpheus
+  9.0.2 honors plugin-declared permissions is unverified; scan routes share the same
+  `admin-cm` permission as everything else.
 - No automated tests; verification is the manual checklist in `CLAUDE.md`.
 
 ## Changelog
 
 See [CHANGELOG.md](CHANGELOG.md). Notable releases: **1.1.5** (security
 hardening, core CSRF, embedded-tab fixes), **1.2.0** (datastore visibility and
-browsing), **1.3.6** (unmanaged labelling, datastore bucket fix, embedded-tab state fixes).
+browsing), **1.3.6** (unmanaged labelling, datastore bucket fix, embedded-tab state fixes), **1.4.1** (datastore scanning).

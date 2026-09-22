@@ -11,13 +11,17 @@
   window.__vmfLoaded = true;
 
   var ROOT = '/';
-  var allVms = [], storedFolders = [], activeFolder = '__all__', searchQ = '';
+  var allVms = [], storedFolders = [], assignments = {}, activeFolder = '__all__', searchQ = '';
   var selectedIds = new Set(), sortCol = 'name', sortAsc = true;
   var cloudFilter = '__all__';
   // Datastore browsing (read-only): a datastore name, NO_DS for "no datastore", or null.
   // Folder selection and datastore selection are mutually exclusive — see resetSelection().
   var NO_DS = '__none__';
   var activeDatastore = null;
+  // Datastore scan (1.4.0): off unless an admin enabled it. dsIndex maps datastore
+  // name -> id, because the sidebar is built from VM data (names) while scanning
+  // addresses stores by id.
+  var scanEnabled = false, scanStores = [], scanCache = {}, scanBusy = false;
 
   // Single reset path for the sidebar selection state so folder and datastore
   // views can never both be active (and so a future SPA-navigation reset has one hook).
@@ -267,7 +271,44 @@
     allVms = results[0].servers || [];
     var db = results[1];
     storedFolders = db.folders || [];
+    assignments = db.assignments || {};
+    await loadScanConfig();
     return db;
+  }
+
+  // Scan config and cached results. Failures here never break the folder view.
+  async function loadScanConfig() {
+    try {
+      var cfg = await get('/scanConfig');
+      scanEnabled = cfg.enabled === true;
+      scanStores = cfg.datastores || [];
+      if (scanEnabled) {
+        var r = await get('/scans');
+        scanCache = r.scans || {};
+      } else { scanCache = {}; }
+    } catch (e) { scanEnabled = false; scanStores = []; scanCache = {}; }
+  }
+
+  function scanStoreByName(name) {
+    for (var i = 0; i < scanStores.length; i++) {
+      if (scanStores[i].name === name) return scanStores[i];
+    }
+    return null;
+  }
+  function scanFor(name) {
+    var st = scanStoreByName(name);
+    return st ? scanCache[String(st.id)] : null;
+  }
+  function ageText(iso) {
+    if (!iso) return '';
+    var t = Date.parse(iso);
+    if (isNaN(t)) return '';
+    var mins = Math.round((Date.now() - t) / 60000);
+    if (mins < 1) return 'just now';
+    if (mins < 60) return mins + ' minute' + (mins !== 1 ? 's' : '') + ' ago';
+    var hrs = Math.round(mins / 60);
+    if (hrs < 48) return hrs + ' hour' + (hrs !== 1 ? 's' : '') + ' ago';
+    return Math.round(hrs / 24) + ' days ago';
   }
 
   // ── Folder helpers ─────────────────────────────────────────────────
@@ -378,10 +419,17 @@
   function dsItem(key, label, st) {
     var active = activeDatastore === key;
     var tip = st.vms + ' VM' + (st.vms!==1?'s':'') + ', ' + st.disks + ' disk' + (st.disks!==1?'s':'') + ' — a VM with disks on several datastores is counted in each';
+    // Scan button appears only for a real datastore the server says is scannable,
+    // and only when an administrator has enabled scanning.
+    var store = (key !== NO_DS && scanEnabled) ? scanStoreByName(key) : null;
+    var scanBtn = store
+      ? '<button class="vmf-fi-btn vmf-scan-btn" data-scan-id="' + esc(store.id) + '" title="Scan this datastore for files Morpheus does not know about">&#128269;</button>'
+      : '';
     return '<div class="vmf-fi' + (active ? ' active' : '') + '" data-ds-key="' + esc(key) + '" title="' + esc(tip) + '">' +
       '<span class="vmf-fi-icon">&#128451;</span>' +
       '<span class="vmf-fi-name">' + esc(label) + '</span>' +
-      '<span class="vmf-fi-count">' + st.vms + '</span></div>';
+      '<span class="vmf-fi-count">' + st.vms + '</span>' +
+      (scanBtn ? '<div class="vmf-fi-actions">' + scanBtn + '</div>' : '') + '</div>';
   }
 
   function isStored(path) { return storedFolders.some(function(f) { return f.path === path; }); }
@@ -476,6 +524,8 @@
     var del = e.target.closest('[data-delfolder]');
     var fi  = e.target.closest('[data-folder-key]');
     var di  = e.target.closest('[data-ds-key]');
+    var sc  = e.target.closest('[data-scan-id]');
+    if (sc) { e.stopPropagation(); vmfScanDatastore(sc.getAttribute('data-scan-id')); return; }
     if (ren) { e.stopPropagation(); vmfRenameFolder(ren.getAttribute('data-rename')); return; }
     if (del) { e.stopPropagation(); vmfDeleteFolder(del.getAttribute('data-delfolder')); return; }
     if (fi)  { vmfSelectFolder(fi.getAttribute('data-folder-key')); return; }
@@ -554,6 +604,11 @@
     });
     el.addEventListener('click', function(e) {
       var mb=e.target.closest('.vmf-move-btn'), rb=e.target.closest('.vmf-rm-btn'), sh=e.target.closest('[data-sort]'), pb=e.target.closest('.vmf-pw-btn');
+      var sc2=e.target.closest('[data-scan-id]');
+      if (sc2) { vmfScanDatastore(sc2.getAttribute('data-scan-id')); return; }
+      var dmv=e.target.closest('.vmf-dsmove-btn'), drm=e.target.closest('.vmf-dsrm-btn');
+      if (dmv) { vmfMoveScanEntry(dmv.getAttribute('data-dskey')); return; }
+      if (drm) { vmfRemoveScanEntry(drm.getAttribute('data-dskey')); return; }
       var ch=e.target.closest('[data-chev]');
       if (ch) {
         var dr = el.querySelector('tr.vmf-disk-row[data-disk-for="'+ch.getAttribute('data-chev')+'"]');
@@ -565,9 +620,17 @@
       if (sh) vmfSort(sh.getAttribute('data-sort'));
       if (pb && !pb.disabled) {
         var pid = parseInt(pb.dataset.id), paction = pb.dataset.action;
-        var pname = (allVms.find(function(v){return v.id===pid;})||{}).name || 'VM '+pid;
+        var pvm = allVms.find(function(v){return v.id===pid;}) || {};
+        var pname = pvm.name || 'VM '+pid;
         var plabel = paction==='start' ? 'Start' : paction==='stop' ? 'Stop' : 'Restart';
-        openConfirm(plabel+' VM', plabel+' "'+esc(pname)+'"?', function() {
+        // A hypervisor host carries every VM running on it — stopping or restarting one
+        // is not the same action as power-cycling a guest, so it gets its own warning.
+        var isHost = pvm.isHost === true;
+        var title = isHost ? plabel+' HYPERVISOR HOST' : plabel+' VM';
+        var body  = isHost && paction !== 'start'
+          ? plabel+' the host "'+esc(pname)+'"? This is a hypervisor host — every VM running on it will go down.'
+          : plabel+' "'+esc(pname)+'"?';
+        openConfirm(title, body, function() {
           pb.disabled = true; pb.style.opacity = '0.5';
           setTimeout(function() { pb.disabled = false; pb.style.opacity = ''; }, 8000);
           vmfPower(pid, paction);
@@ -580,7 +643,8 @@
     var vms = getFiltered(), el = document.getElementById('vmf-vlist');
     if (!el) return;
     if (!vms.length) {
-      el.innerHTML = '<div class="vmf-empty"><div class="vmf-empty-icon">'+(activeDatastore?'&#128451;':'&#128193;')+'</div><div>' + (searchQ?'No matches.':activeDatastore?'No VMs on this datastore.':'Folder is empty.') + '</div></div>';
+      el.innerHTML = '<div class="vmf-empty"><div class="vmf-empty-icon">'+(activeDatastore?'&#128451;':'&#128193;')+'</div><div>' + (searchQ?'No matches.':activeDatastore?'No VMs on this datastore.':'Folder is empty.') + '</div></div>' + scanPanel();
+      bindVlist(el);
       setStatus('0 VMs'); return;
     }
     var cols = [['name','Name'],['powerState','Status'],['osType','OS'],['maxMemory','Memory'],['maxCores','vCPU'],['externalIp','IP'],['cloudName','Cloud'],['datastores','Datastore']];
@@ -622,7 +686,7 @@
         '</div></td></tr>' + diskDetailRow(vm);
     });
     html += '</tbody></table>';
-    el.innerHTML = html;
+    el.innerHTML = html + scanPanel();
 
     bindVlist(el);
     // Status reflects the rows actually listed; when host/cloud scoping or a folder
@@ -666,6 +730,160 @@
     var bc=document.getElementById('vmf-bc');
     if(bc) bc.innerHTML='&#128193; <b>'+esc(key==='__all__'?'All VMs':key===ROOT?'Unorganized':key)+'</b>';
   };
+
+  // On-disk entries are assigned with the key ds:<datastoreId>:<dirname>; the server
+  // validates the key against its cached scan before writing it.
+  window.vmfMoveScanEntry = function(key) {
+    var paths = allPaths();
+    var opts = paths.map(function(p){ return '<option value="'+esc(p)+'">'+esc(p)+'</option>'; }).join('');
+    openModal('Move to Folder', [
+      fg('Folder', '<select id="vmf-dsmove-sel">'+opts+'</select>', 'Or type a new path below'),
+      fg('New path', '<input id="vmf-dsmove-new" type="text" placeholder="/Production/Imported">', '')
+    ], [
+      {l:'Cancel', fn:vmfCloseModal},
+      {l:'Move', primary:true, fn: async function() {
+        var sel = document.getElementById('vmf-dsmove-sel');
+        var nw  = document.getElementById('vmf-dsmove-new');
+        var path = (nw && nw.value.trim()) || (sel && sel.value) || '';
+        if (!path) return;
+        if (path.charAt(0) !== '/') path = '/' + path;
+        vmfCloseModal();
+        var d = await post('/assign', {vmId: key, path: path});
+        if (d.success) { await fetchAll(); renderTree(); renderDatastores(); renderVms(); vmfToast('Moved'); }
+        else vmfToast('Move failed: ' + (d.error || 'unknown'), true);
+      }}
+    ]);
+  };
+
+  window.vmfRemoveScanEntry = async function(key) {
+    var d = await post('/unassign', {vmId: key});
+    if (d.success) { await fetchAll(); renderTree(); renderDatastores(); renderVms(); vmfToast('Removed from folder'); }
+    else vmfToast('Remove failed: ' + (d.error || 'unknown'), true);
+  };
+
+  // Runs a scan on one datastore, then re-renders. Never runs on page load.
+  window.vmfScanDatastore = async function(dsId) {
+    if (scanBusy) { vmfToast('A scan is already running', true); return; }
+    var store = null;
+    for (var i = 0; i < scanStores.length; i++) { if (String(scanStores[i].id) === String(dsId)) store = scanStores[i]; }
+    if (!store) { vmfToast('Datastore not scannable', true); return; }
+    scanBusy = true;
+    setStatus('Scanning ' + store.name + '…');
+    try {
+      var d = await post('/scan', { datastoreId: dsId });
+      if (d.success) {
+        scanCache[String(dsId)] = d.scan;
+        if (d.scan && d.scan.readable === false) {
+          vmfToast('Scanned, but not readable: ' + (d.scan.error || 'permission denied'), true);
+        } else {
+          var n = (d.scan && d.scan.vmDirs ? d.scan.vmDirs.filter(function(v){ return !v.inMorpheus; }).length : 0);
+          vmfToast('Scanned ' + store.name + ' — ' + n + ' on-disk VM' + (n !== 1 ? 's' : '') + ' not in Morpheus');
+        }
+        if (activeDatastore !== store.name) vmfSelectDatastore(store.name);
+        else { renderDatastores(); renderVms(); }
+      } else {
+        vmfToast(d.timedOut ? 'Scan timed out' : 'Scan failed: ' + (d.error || 'unknown'), true);
+      }
+    } catch (e) {
+      vmfToast('Scan error: ' + e.message, true);
+    } finally { scanBusy = false; }
+  };
+
+  // Scan results for the datastore currently being browsed, rendered under the table.
+  function scanPanel() {
+    if (!scanEnabled || !activeDatastore || activeDatastore === NO_DS) return '';
+    var store = scanStoreByName(activeDatastore);
+    if (!store) return '';
+    var sc = scanCache[String(store.id)];
+    if (!sc) {
+      return '<div class="vmf-scan-panel"><div class="vmf-scan-head">' +
+        '<b>On disk</b><span class="vmf-scan-meta">not scanned yet</span>' +
+        '<button class="vmf-btn vmf-btn-outline vmf-btn-sm" data-scan-id="' + esc(store.id) + '">&#128269; Scan datastore</button>' +
+        '</div></div>';
+    }
+    var head = '<div class="vmf-scan-head"><b>On disk</b>' +
+      '<span class="vmf-scan-meta">scanned on ' + esc(sc.scannedOn || '?') + ' ' + esc(ageText(sc.at)) + '</span>' +
+      '<button class="vmf-btn vmf-btn-outline vmf-btn-sm" data-scan-id="' + esc(store.id) + '">&#8635; Rescan</button></div>';
+
+    if (sc.readable === false) {
+      return '<div class="vmf-scan-panel">' + head +
+        '<div class="vmf-scan-warn">' + esc(sc.error || 'This datastore could not be read on the scanning host.') + '</div></div>';
+    }
+
+    var orphans = (sc.vmDirs || []).filter(function(v){ return !v.inMorpheus; });
+    var body = '';
+
+    body += '<div class="vmf-scan-sect">On disk, not in Morpheus <span class="vmf-fi-count">' + orphans.length + '</span></div>';
+    if (!orphans.length) {
+      body += '<div class="vmf-scan-empty">Every VM directory on this datastore matches a VM in Morpheus.</div>';
+    } else {
+      body += '<table class="vmft-sub vmf-scan-tbl"><thead><tr><th>Directory</th><th>Disks</th><th>Size</th><th>XML</th><th>Newest</th><th>Folder</th>' +
+              (window.vmfReadOnly ? '' : '<th></th>') + '</tr></thead><tbody>';
+      orphans.forEach(function(v) {
+        var key = 'ds:' + store.id + ':' + v.name;
+        var fp = assignments[key] || '';
+        var kindBadge = v.kind === 'collection'
+          ? ' <span class="vmf-badge-un" title="Several domain XMLs, or XMLs that do not match the directory name — a backup or collection dump rather than one VM">backup/collection</span>'
+          : '';
+        body += '<tr><td>' + esc(v.name) + kindBadge + '</td>' +
+          '<td>' + (v.diskFiles ? v.diskFiles.length : 0) + '</td>' +
+          '<td>' + fmtMemSmall(v.totalBytes) + '</td>' +
+          '<td>' + esc((v.xmlFiles || []).join(', ') || '—') + '</td>' +
+          '<td>' + esc(v.newest || '—') + '</td>' +
+          '<td>' + (fp ? '<span class="vmf-tag">' + esc(fp.split('/').filter(Boolean).pop() || '/') + '</span>'
+                       : '<span style="color:#767676;font-style:italic">Unorganized</span>') + '</td>' +
+          (window.vmfReadOnly ? '' :
+            '<td><button class="vmf-act vmf-dsmove-btn" data-dskey="' + esc(key) + '">Move</button>' +
+            (fp ? '<button class="vmf-act vmf-act-x vmf-dsrm-btn" data-dskey="' + esc(key) + '" title="Remove from folder">&#10006;</button>' : '') + '</td>') +
+          '</tr>';
+      });
+      body += '</tbody></table>';
+    }
+
+    // Directories with disk-sized files but no domain XML. Not "VMs" by the detection
+    // rule, but a 30 GB disk with no XML is worth surfacing, not burying in Other.
+    var diskDirs = (sc.diskDirs || []).filter(function(d){ return !d.inMorpheus; });
+    body += '<div class="vmf-scan-sect">Disk-only directories <span class="vmf-fi-count">' + diskDirs.length + '</span></div>';
+    if (!diskDirs.length) {
+      body += '<div class="vmf-scan-empty">No directories with disks but no domain XML.</div>';
+    } else {
+      body += '<table class="vmft-sub vmf-scan-tbl"><thead><tr><th>Directory</th><th>Disks</th><th>Size</th><th>XML</th><th>Newest</th></tr></thead><tbody>';
+      diskDirs.forEach(function(d) {
+        body += '<tr><td>' + esc(d.name) + '</td>' +
+          '<td>' + (d.diskFiles ? d.diskFiles.length : 0) + '</td>' +
+          '<td>' + fmtMemSmall(d.totalBytes) + '</td>' +
+          '<td>' + esc((d.xmlFiles || []).join(', ') || '—') + '</td>' +
+          '<td>' + esc(d.newest || '—') + '</td></tr>';
+      });
+      body += '</tbody></table>';
+    }
+
+    var orphanVols = (sc.volumes || []).filter(function(v){ return !v.volumeId; });
+    body += '<div class="vmf-scan-sect">Orphaned volumes <span class="vmf-fi-count">' + orphanVols.length + '</span></div>';
+    if (!orphanVols.length) {
+      body += '<div class="vmf-scan-empty">No volume files without a matching Morpheus record.</div>';
+    } else {
+      body += '<table class="vmft-sub vmf-scan-tbl"><thead><tr><th>Volume</th><th>Size</th><th>Modified</th></tr></thead><tbody>';
+      orphanVols.forEach(function(v) {
+        body += '<tr><td>' + esc(v.uuid) + '</td><td>' + fmtMemSmall(v.size) + '</td><td>' + esc(v.mtime || '—') + '</td></tr>';
+      });
+      body += '</tbody></table>';
+      body += '<div class="vmf-scan-empty">Morpheus virtual images (ISOs such as virtio-win) are not StorageVolumes, so they always appear here.</div>';
+    }
+
+    var other = sc.other || [];
+    body += '<details class="vmf-scan-other"><summary>Other files (' + other.length + ')</summary>';
+    if (other.length) {
+      body += '<table class="vmft-sub vmf-scan-tbl"><thead><tr><th>Name</th><th>Type</th><th>Size</th></tr></thead><tbody>';
+      other.forEach(function(o) {
+        body += '<tr><td>' + esc(o.name) + '</td><td>' + esc(o.type || '') + '</td><td>' + fmtMemSmall(o.size) + '</td></tr>';
+      });
+      body += '</tbody></table>';
+    }
+    body += '</details>';
+
+    return '<div class="vmf-scan-panel">' + head + body + '</div>';
+  }
 
   // Read-only datastore view: filters the table, never writes assignments.
   window.vmfSelectDatastore = function(key) {

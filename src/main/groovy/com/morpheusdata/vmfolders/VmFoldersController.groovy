@@ -29,7 +29,7 @@ class VmFoldersController implements PluginController {
 
     static final String DATA_DIR  = '/var/opt/morpheus/morpheus-ui/plugins'
     static final String DB_FILE   = "${DATA_DIR}/vm-folders.json"
-    static final String VERSION   = '1.3.6'
+    static final String VERSION   = '1.4.1'
     static final String BAK_FILE  = "${DATA_DIR}/vm-folders.json.bak"
 
     VmFoldersController(Plugin plugin, MorpheusContext morpheusContext) {
@@ -62,7 +62,13 @@ class VmFoldersController implements PluginController {
             p("/vmFolders/serverActions",   "serverActions"),
             p("/vmFolders/executeAction",   "executeAction"),
             p("/vmFolders/resync",          "resync"),
-            p("/vmFolders/logs",      "logs")
+            p("/vmFolders/logs",      "logs"),
+            // 1.4.0 datastore scan. `scan` runs a command on a host and is a mutation;
+            // `scans` and `scanConfig` are read-only.
+            p("/vmFolders/scan",       "scan"),
+            p("/vmFolders/scans",      "scans"),
+            p("/vmFolders/scanConfig", "scanConfig"),
+            p("/vmFolders/scanEnable", "scanEnable")
         ]
     }
 
@@ -221,6 +227,11 @@ class VmFoldersController implements PluginController {
         } catch(ex) { return false }
     }
 
+    /** True for a hypervisor host (as opposed to a guest VM): drives a stronger power confirm. */
+    private static boolean isHypervisorHost(def s) {
+        try { return s.computeServerType?.vmHypervisor == true } catch(ex) { return false }
+    }
+
     // ── Disks ─────────────────────────────────────────────────────────
     // computeServer.list(DataQuery) hydrates volumes on 9.0.2 (verified 2026-09-20),
     // so no per-server fetch is needed. Datastore may be null on VME volumes —
@@ -253,6 +264,397 @@ class VmFoldersController implements PluginController {
                 root     : v.rootVolume ? true : false
             ]
         }
+    }
+
+    /** ds:<datastoreId>:<dirname> — an entry found on disk by a datastore scan. */
+    private static boolean isScanKey(String key) { return key?.startsWith('ds:') }
+
+    /**
+     * A scan key is usable only when the caller can see that datastore and the
+     * directory appeared in its cached scan. Keeps scan keys tenant-scoped and stops
+     * arbitrary strings being written into the assignments map.
+     */
+    private boolean scanKeyVisible(ViewModel<Map> model, String key) {
+        try {
+            def parts = key.split(':', 3)
+            if (parts.size() != 3 || !parts[1].isLong() || !parts[2]) return false
+            if (!scannableDatastores(model).any { it.id?.toString() == parts[1] }) return false
+            def cached = readDb()?.scans?.get(parts[1])
+            return cached?.vmDirs?.any { it.name?.toString() == parts[2] } ? true : false
+        } catch(ex) { return false }
+    }
+
+    // ══ Datastore scan (1.4.0) ═════════════════════════════════════════
+    // Reads what is actually on a datastore and reports directories and volume
+    // files that Morpheus does not know about. Read-only: it runs `find`, `test`
+    // and `head` on a host and never writes to the datastore.
+    //
+    // Verified on Morpheus 9.0.2 / VME (2026-09-22):
+    //  - executeCommandOnServer(server, cmd) 2-arg runs through the Morpheus agent
+    //    in ~50-80 ms. Do not use the long overloads.
+    //  - stdout arrives in TaskResult.data (String); TaskResult.output is always null
+    //    on the agent path.
+    //  - the agent runs as morpheus-node (uid 996, groups libvirt/kvm/libvirt-qemu).
+    //    Whether it can read a mount-based store depends on that store's ownership and
+    //    any NFS squash: a store it cannot read is reported per-store as not readable,
+    //    never as a failed scan.
+    //  - the path comes from Datastore.externalPath and is allow-listed below.
+
+    static final String SCAN_SETTING = 'scanEnabled'
+    static final int    SCAN_TIMEOUT_SEC = 30
+    /** /mnt/<uuid> (NFS, GFS2) or /var/morpheus/kvm/<name> (host-local directory). */
+    static final java.util.regex.Pattern SCAN_PATH_OK = ~/^(\/mnt\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\/var\/morpheus\/kvm\/[a-z0-9-]+)$/
+    static final List<String> SHARED_TYPES = ['libvirt-netfs-nfs', 'libvirt-dir-gfs2']
+
+    /** Scanning is off unless an admin turned it on. Fail closed on any error. */
+    private boolean scanEnabled() {
+        try {
+            def raw = morpheusContext.getSettings(plugin)?.blockingGet()
+            if (raw) {
+                def parsed = new JsonSlurper().parseText(raw as String)
+                def v = (parsed instanceof Map) ? parsed[SCAN_SETTING] : null
+                if (v?.toString()?.equalsIgnoreCase('true') || v == true) return true
+            }
+        } catch(ex) { log.debug("VmFolders: plugin settings unreadable (${ex.message}); falling back to the local flag") }
+        // Fallback for appliances where the plugin settings form is unavailable: a flag
+        // in the plugin's own database, writable only through the permission-gated
+        // scanEnable route. Both default to off.
+        try { return readDb()?.settings?.get(SCAN_SETTING) == true } catch(ex) { return false }
+    }
+
+    /** Datastores the caller may see, minus Morpheus-internal and offline stores. */
+    private List scannableDatastores(ViewModel<Map> model) {
+        def stores = morpheusContext.services.cloud.datastore.list(userQuery(model))?.toList() ?: []
+        return stores.findAll { d ->
+            try {
+                if (d.online == false) return false
+                if (d.externalId?.toString()?.startsWith('morpheus-')) return false
+                return d.externalPath && SCAN_PATH_OK.matcher(d.externalPath.toString()).matches()
+            } catch(ex) { return false }
+        }
+    }
+
+    private static boolean isSharedStore(def d) {
+        try { return SHARED_TYPES.contains(d.datastoreType?.code?.toString()) } catch(ex) { return false }
+    }
+
+    /**
+     * Which host to run on: a shared store can be scanned from any online hypervisor
+     * host; a host-local store must be scanned on the host that owns it.
+     */
+    private def scanHostFor(ViewModel<Map> model, def store) {
+        def hosts = morpheusContext.services.computeServer.list(userQuery(model)).toList().findAll {
+            canAccess(model, it) && isHypervisorHost(it)
+        }
+        if (!isSharedStore(store) && store.hostId) {
+            return hosts.find { it.id == store.hostId }
+        }
+        return hosts.find { it.powerState?.toString()?.toLowerCase()?.contains('on') } ?: hosts.find()
+    }
+
+    /** One agent command. Returns stdout (TaskResult.data) or null when it failed. */
+    private String runOnHost(def host, String cmd) {
+        try {
+            def r = morpheusContext.executeCommandOnServer(host, cmd)
+                        .timeout(SCAN_TIMEOUT_SEC, java.util.concurrent.TimeUnit.SECONDS)
+                        .blockingGet()
+            if (r?.success != true) {
+                log.warn("VmFolders scan: command failed on ${host?.name}: exitCode=${r?.exitCode} error=${r?.error}")
+                return null
+            }
+            // stdout is in `data` on the agent path; fall back to `output` for any
+            // platform where that is not true.
+            def out = r?.data ?: r?.output
+            return out != null ? out.toString() : ''
+        } catch(java.util.concurrent.TimeoutException tx) {
+            throw tx
+        } catch(ex) {
+            log.warn("VmFolders scan: command threw on ${host?.name}: ${ex.class.name}: ${ex.message}")
+            return null
+        }
+    }
+
+    /** GET /scanConfig — is scanning enabled, and which datastores can be scanned. */
+    def scanConfig(ViewModel<Map> model) {
+        try {
+            if (!model?.user?.account) return reject(model, 401, 'no authenticated user')
+            def enabled = scanEnabled()
+            def stores = enabled ? scannableDatastores(model).collect { d ->
+                [ id: d.id, name: d.name, path: d.externalPath?.toString(),
+                  type: d.datastoreType?.code?.toString(), shared: isSharedStore(d) ]
+            } : []
+            return JsonResponse.of([success: true, enabled: enabled, datastores: stores])
+        } catch(e) {
+            log.error("scanConfig error: ${e.message}", e)
+            return JsonResponse.of([success: false, error: e.message, enabled: false, datastores: []])
+        }
+    }
+
+    /** POST /scanEnable — admin switch for appliances without the plugin settings form. */
+    def scanEnable(ViewModel<Map> model) {
+        try {
+            def denied = requireMutation(model); if (denied) return denied
+            def on = model?.request?.getParameter('enabled')?.toString() == 'true'
+            mutateDb { Map db ->
+                def settings = db.settings instanceof Map ? db.settings : [:]
+                settings[SCAN_SETTING] = on
+                db.settings = settings
+                return true
+            }
+            log.info("VmFolders scan: scanning ${on ? 'ENABLED' : 'disabled'} by user=${model?.user?.username}")
+            return JsonResponse.of([success: true, enabled: on])
+        } catch(e) {
+            log.error("scanEnable error: ${e.message}", e)
+            return JsonResponse.of([success: false, error: e.message])
+        }
+    }
+
+    /** GET /scans — cached scan results (all, or one datastore via ?datastoreId=). */
+    def scans(ViewModel<Map> model) {
+        try {
+            if (!model?.user?.account) return reject(model, 401, 'no authenticated user')
+            def all = readDb()?.scans instanceof Map ? readDb().scans : [:]
+            def visible = scannableDatastores(model)*.id*.toString() as Set
+            def dsId = model?.request?.getParameter('datastoreId')?.toString()
+            def out = [:]
+            all.each { k, v -> if (visible.contains(k.toString()) && (!dsId || dsId == k.toString())) out[k] = v }
+            return JsonResponse.of([success: true, scans: out])
+        } catch(e) {
+            log.error("scans error: ${e.message}", e)
+            return JsonResponse.of([success: false, error: e.message, scans: [:]])
+        }
+    }
+
+    /** POST /scan?datastoreId=N — run the scan and cache the result. */
+    def scan(ViewModel<Map> model) {
+        def started = System.currentTimeMillis()
+        try {
+            def denied = requireMutation(model); if (denied) return denied
+            if (!scanEnabled()) return reject(model, 403, 'datastore scanning is disabled')
+
+            def dsId = model?.request?.getParameter('datastoreId')?.toString()
+            if (!dsId?.isLong()) return JsonResponse.of([success: false, error: 'datastoreId required'])
+            def store = scannableDatastores(model).find { it.id?.toString() == dsId }
+            if (!store) return reject(model, 404, 'datastore not found')
+
+            def path = store.externalPath.toString()
+            if (!SCAN_PATH_OK.matcher(path).matches()) return reject(model, 400, 'datastore path is not scannable')
+
+            def host = scanHostFor(model, store)
+            if (!host) return reject(model, 409, 'no host available to scan this datastore')
+
+            def result = scanStore(model, store, host, path)
+            result.at = new Date().toString()
+            result.scannedOn = host.name?.toString()
+            result.scannedOnId = host.id
+            result.datastoreId = store.id
+            result.datastoreName = store.name?.toString()
+            result.path = path
+
+            mutateDb { Map db ->
+                def scansMap = db.scans instanceof Map ? db.scans : [:]
+                scansMap[dsId] = result
+                db.scans = scansMap
+                return true
+            }
+            def ms = System.currentTimeMillis() - started
+            log.info("VmFolders scan: user=${model?.user?.username} datastore=${store.name}(${dsId}) host=${host.name} " +
+                     "ms=${ms} readable=${result.readable} vmDirs=${result.vmDirs?.size()} diskDirs=${result.diskDirs?.size()} " +
+                     "volumes=${result.volumes?.size()} other=${result.other?.size()}")
+            return JsonResponse.of([success: true, scan: result])
+        } catch(java.util.concurrent.TimeoutException tx) {
+            log.warn("VmFolders scan: timed out after ${SCAN_TIMEOUT_SEC}s")
+            return JsonResponse.of([success: false, error: "scan timed out after ${SCAN_TIMEOUT_SEC}s", timedOut: true])
+        } catch(e) {
+            log.error("scan error: ${e.message}", e)
+            return JsonResponse.of([success: false, error: e.message])
+        }
+    }
+
+    /** The scan itself: readability check, one find pass, one bounded XML pass. */
+    private Map scanStore(ViewModel<Map> model, def store, def host, String path) {
+        def out = [readable: true, vmDirs: [], diskDirs: [], volumes: [], other: []]
+
+        // 1. Can the agent user read this store at all? A store it cannot read is a
+        //    per-store result, not an error — ownership and NFS squash vary per site.
+        def probe = runOnHost(host, "test -r '${path}' && test -x '${path}' && echo VMF_OK || echo VMF_DENIED")
+        if (probe == null) { out.readable = false; out.error = 'command failed on host'; return out }
+        if (!probe.contains('VMF_OK')) {
+            out.readable = false
+            out.error = "not readable by the agent user (morpheus-node) on ${host.name}"
+            return out
+        }
+
+        // 2. One bounded find: depth <= 2, regular files only, either >1MB or *.xml.
+        def findCmd = "find '${path}' -mindepth 1 -maxdepth 2 \\( -type f -size +1M -o -type f -name '*.xml' \\) " +
+                      "-printf '%d\\t%y\\t%s\\t%TY-%Tm-%Td\\t%p\\n' 2>/dev/null"
+        def findOut = runOnHost(host, findCmd)
+        if (findOut == null) { out.readable = false; out.error = 'find failed on host'; return out }
+
+        // 3. Which XMLs are libvirt domains: first 512 bytes, tested on the host.
+        def xmlCmd = "find '${path}' -mindepth 1 -maxdepth 2 -type f -name '*.xml' 2>/dev/null | while read f; do " +
+                     "if head -c 512 \"\$f\" | grep -q '<domain'; then echo \"\$f\"; fi; done"
+        def domainOut = runOnHost(host, xmlCmd) ?: ''
+        def domainXmls = domainOut.readLines()*.trim().findAll { it } as Set
+
+        parseScan(out, path, findOut, domainXmls)
+        annotateScan(model, out)
+        return out
+    }
+
+    /**
+     * A directory holding several domain XMLs, or XMLs that do not share the directory's
+     * name, is a backup or collection dump rather than one VM (e.g. `converted/` with 14
+     * `ova-test_backup_*.xml`). Label it; the scan cannot know more than that.
+     */
+    private static String dirKind(Map e) {
+        def xmls = e.domainXmls ?: []
+        if (xmls.size() > 3) return 'collection'
+        def dirName = e.name?.toString()?.toLowerCase()
+        def matches = xmls.any { x ->
+            def base = x.toString().toLowerCase().replaceAll(/\.xml$/, '')
+            base == dirName || base.startsWith(dirName + '-') || base.startsWith(dirName + '_')
+        }
+        return matches ? 'vm' : 'collection'
+    }
+
+    /** Turns find output into vmDirs / diskDirs / volumes / other. */
+    private void parseScan(Map out, String path, String findOut, Set domainXmls) {
+        def dirs = [:]      // directory name -> entry
+        def flat = []       // depth-1 files
+        findOut.readLines().each { line ->
+            def f = line.split('\t')
+            if (f.size() < 5) return
+            def depth = f[0]?.trim()?.isInteger() ? f[0].trim() as Integer : 0
+            def size  = f[2]?.trim()?.isLong() ? f[2].trim() as Long : 0L
+            def mtime = f[3]?.trim()
+            def full  = f[4]
+            def rel   = full.startsWith(path + '/') ? full.substring(path.length() + 1) : full
+            if (depth == 1) {
+                flat << [name: rel, size: size, mtime: mtime, full: full]
+            } else {
+                def dirName = rel.contains('/') ? rel.substring(0, rel.indexOf('/')) : rel
+                def fileName = rel.contains('/') ? rel.substring(rel.indexOf('/') + 1) : rel
+                def e = dirs[dirName]
+                if (!e) { e = [name: dirName, xmlFiles: [], domainXmls: [], diskFiles: [], totalBytes: 0L, newest: null, isVm: false]; dirs[dirName] = e }
+                if (fileName.toLowerCase().endsWith('.xml')) {
+                    e.xmlFiles << fileName
+                    if (domainXmls.contains(full)) { e.isVm = true; e.domainXmls << fileName }
+                } else {
+                    // Disk images on VME are extension-less regular files over 1MB,
+                    // which is what the find filter already selected for.
+                    e.diskFiles << [name: fileName, size: size, mtime: mtime]
+                    e.totalBytes += size
+                }
+                if (!e.newest || (mtime && mtime > e.newest)) e.newest = mtime
+            }
+        }
+
+        // A directory holding a libvirt domain XML is a VM. One holding disk-sized files
+        // but no domain XML is reported separately rather than buried in Other: a
+        // directory with a 30 GB disk and no XML is exactly what an operator wants to see.
+        // Everything else at depth 2 is clutter (extracted OVAs, zips, backups).
+        dirs.values().each { e ->
+            if (e.isVm) {
+                out.vmDirs << [name: e.name, xmlFiles: e.xmlFiles, diskFiles: e.diskFiles,
+                               totalBytes: e.totalBytes, newest: e.newest, inMorpheus: null,
+                               kind: dirKind(e)]
+            } else if (e.diskFiles) {
+                out.diskDirs << [name: e.name, diskFiles: e.diskFiles, xmlFiles: e.xmlFiles,
+                                 totalBytes: e.totalBytes, newest: e.newest, inMorpheus: null]
+            } else {
+                out.other << [name: e.name, type: 'dir', size: e.totalBytes,
+                              files: e.xmlFiles.size() + e.diskFiles.size()]
+            }
+        }
+
+        // Flat files named like a uuid are Morpheus-provisioned volumes; the rest is clutter.
+        def uuidRe = ~/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+        flat.each { f ->
+            if (uuidRe.matcher(f.name).matches()) {
+                out.volumes << [uuid: f.name, size: f.size, mtime: f.mtime, full: f.full, volumeId: null, serverId: null]
+            } else {
+                out.other << [name: f.name, type: 'file', size: f.size]
+            }
+        }
+        out.vmDirs = out.vmDirs.sort { it.name }
+        out.diskDirs = out.diskDirs.sort { it.name }
+        out.volumes = out.volumes.sort { it.uuid }
+        out.other = out.other.sort { it.name }
+    }
+
+    /**
+     * Marks which findings Morpheus already knows about: a VM directory whose name
+     * matches a scoped VM, and a uuid file matching a StorageVolume on one of them.
+     * Informational — a managed VM's own directory is not an orphan.
+     */
+    private void annotateScan(ViewModel<Map> model, Map out) {
+        try {
+            def servers = morpheusContext.services.computeServer.list(
+                userQuery(model).withFilter(new DataFilter('vmHypervisor', false))
+            ).toList().findAll { canAccess(model, it) }
+
+            def byName = [:]
+            servers.each { s -> if (s.name) byName[s.name.toString().toLowerCase()] = s.id }
+            out.vmDirs.each { d -> d.inMorpheus = byName[d.name?.toString()?.toLowerCase()] }
+            out.diskDirs.each { d -> d.inMorpheus = byName[d.name?.toString()?.toLowerCase()] }
+
+            // Index every identifier form a volume file's name could take. 1.4.0 indexed
+            // only the raw values of four fields and looked up by full path or basename,
+            // which missed every volume on cargo-bay: the stored form and the on-disk
+            // name differ (path vs basename, and an id may carry a suffix). So index each
+            // value AND its basename, lowercased, and look up the same way.
+            def volIndex = [:]
+            def indexKey = { String k, Map hit ->
+                if (!k) return
+                def lower = k.toLowerCase()
+                if (!volIndex.containsKey(lower)) volIndex[lower] = hit
+                def base = lower.contains('/') ? lower.substring(lower.lastIndexOf('/') + 1) : lower
+                if (base && !volIndex.containsKey(base)) volIndex[base] = hit
+            }
+            servers.each { s ->
+                try {
+                    (s.volumes ?: []).each { v ->
+                        def hit = [volumeId: v.id, serverId: s.id]
+                        [v.volumePath, v.uuid, v.externalId, v.internalId, v.uniqueId, v.name].each { val ->
+                            indexKey(val?.toString(), hit)
+                        }
+                    }
+                } catch(ex) {}
+            }
+            out.volumes.each { vol ->
+                def full = vol.full?.toString()?.toLowerCase()
+                def base = vol.uuid?.toString()?.toLowerCase()
+                def hit = (full ? volIndex[full] : null) ?: (base ? volIndex[base] : null)
+                if (hit) { vol.volumeId = hit.volumeId; vol.serverId = hit.serverId }
+            }
+
+            // TEMPORARY 1.4.1 diagnostic — remove once orphan matching is confirmed.
+            // Logs what is still unmatched next to the identifier forms actually stored
+            // for volumes on this datastore, so a remaining mismatch names itself.
+            def unmatched = out.volumes.findAll { !it.volumeId }
+            if (unmatched) {
+                log.info("VmFolders scan/match: ${unmatched.size()} unmatched volume file(s) on ${out.datastoreName ?: out.path}: " +
+                         unmatched.take(20).collect { it.uuid }.join(', '))
+                int logged = 0
+                servers.each { s ->
+                    if (logged >= 40) return
+                    try {
+                        (s.volumes ?: []).each { v ->
+                            if (logged >= 40) return
+                            def dsName = null
+                            try { def d = v.datastore; dsName = (d instanceof String ? d : d?.name)?.toString() } catch(ig) {}
+                            if (out.datastoreName && dsName && dsName != out.datastoreName) return
+                            logged++
+                            log.info("VmFolders scan/match: server=${s.name} volumeId=${v.id} datastore=${dsName} " +
+                                     "volumePath=[${v.volumePath}] uuid=[${v.uuid}] externalId=[${v.externalId}] " +
+                                     "internalId=[${v.internalId}] uniqueId=[${v.uniqueId}] name=[${v.name}] " +
+                                     "deviceDisplayName=[${v.deviceDisplayName}]")
+                        }
+                    } catch(ex) {}
+                }
+            }
+        } catch(ex) { log.warn("VmFolders scan: annotate failed: ${ex.message}") }
     }
 
     // ── API: VM list ──────────────────────────────────────────────────
@@ -295,7 +697,8 @@ class VmFoldersController implements PluginController {
                     folderPath : assignments[s.id?.toString()] ?: '/',
                     disks      : disks,
                     datastores : disks*.datastore.findAll { it }.unique().sort(),
-                    unmanaged  : isUnmanaged(s)
+                    unmanaged  : isUnmanaged(s),
+                    isHost     : isHypervisorHost(s)
                 ]
             }
             return JsonResponse.of([servers: result, meta: [total: result.size(), unmanaged: result.count { it.unmanaged }]])
@@ -398,8 +801,16 @@ class VmFoldersController implements PluginController {
             def vmId = model?.request?.getParameter('vmId') as String
             def path = model?.request?.getParameter('path') as String
             if (!vmId || !path) return JsonResponse.of([success: false, error: 'vmId and path required'])
-            if (!vmId.isLong()) return JsonResponse.of([success: false, error: 'invalid vmId'])
-            if (!scopedServer(model, vmId as Long)) return reject(model, 404, 'server not found')
+            // Two key shapes: a numeric compute server id, or an on-disk entry found by a
+            // datastore scan, keyed ds:<datastoreId>:<dirname>. Server ids keep the strict
+            // isLong() check; scan keys are validated separately and never reach a
+            // platform call, so isLong() is NOT relaxed.
+            if (isScanKey(vmId)) {
+                if (!scanKeyVisible(model, vmId)) return reject(model, 404, 'datastore entry not found')
+            } else {
+                if (!vmId.isLong()) return JsonResponse.of([success: false, error: 'invalid vmId'])
+                if (!scopedServer(model, vmId as Long)) return reject(model, 404, 'server not found')
+            }
             if (!path.startsWith('/')) path = '/' + path
             def fpath = path
             mutateDb { Map db ->
@@ -428,6 +839,18 @@ class VmFoldersController implements PluginController {
             def denied = requireMutation(model); if (denied) return denied
             def vmId = model?.request?.getParameter('vmId') as String
             if (!vmId) return JsonResponse.of([success: false, error: 'vmId required'])
+            if (isScanKey(vmId)) {
+                if (!scanKeyVisible(model, vmId)) return reject(model, 404, 'datastore entry not found')
+                def removedKey = false
+                mutateDb { Map db ->
+                    def asgn = db.assignments as Map ?: [:]
+                    if (!asgn.containsKey(vmId)) return false
+                    asgn.remove(vmId); db.assignments = asgn; removedKey = true
+                    addHistory(db, 'unassign', [vmId: vmId])
+                    return true
+                }
+                return JsonResponse.of([success: true, removed: removedKey])
+            }
             if (!vmId.isLong()) return JsonResponse.of([success: false, error: 'invalid vmId'])
             // Allow clearing stale assignments for VMs no longer in Morpheus,
             // but never touch a VM that exists and belongs to another tenant.
@@ -596,6 +1019,9 @@ class VmFoldersController implements PluginController {
     body.dark table.vmft tbody tr.sel  { background: var(--hpe-selected); }
     body.dark #vmf-ds-head, body.dark tr.vmf-disk-row, body.dark tr.vmf-disk-row:hover { background: var(--hpe-bg); }
     body.dark .vmf-badge-un { background:#3A2E1A; color:#E0B870; border-color:#5A4828; }
+    body.dark .vmf-scan-panel { background: var(--hpe-white); }
+    body.dark .vmf-scan-head { background: var(--hpe-bg); }
+    body.dark .vmf-scan-warn { background:#3A2E1A; color:#E0B870; border-color:#5A4828; }
     body.dark #vmf-search { background: var(--hpe-white); color: var(--hpe-text); border-color: var(--hpe-border); }
     body.dark .vmf-act   { background: var(--hpe-white); color: var(--hpe-text); border-color: var(--hpe-border); }
     body.dark .vmf-act:hover { border-color: var(--hpe-green); color: var(--hpe-green); }
@@ -674,6 +1100,17 @@ class VmFoldersController implements PluginController {
     .vmft-name a { color:var(--hpe-green-dark); text-decoration:none; font-weight:500; }
     .vmft-name a:hover { text-decoration:underline; }
     .vmf-dot { display:inline-block; width:7px; height:7px; border-radius:50%; margin-right:5px; vertical-align:middle; }
+    .vmf-scan-panel { margin:14px; border:1px solid var(--hpe-border); border-radius:4px; background:#fff; }
+    .vmf-scan-head { display:flex; align-items:center; gap:10px; padding:8px 12px; border-bottom:1px solid var(--hpe-border); background:var(--hpe-bg); font-size:12px; }
+    .vmf-scan-head b { font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--hpe-muted); }
+    .vmf-scan-meta { color:var(--hpe-muted); font-size:11px; margin-right:auto; }
+    .vmf-scan-sect { padding:9px 12px 4px; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.05em; color:var(--hpe-muted); display:flex; align-items:center; gap:7px; }
+    .vmf-scan-empty { padding:0 12px 10px; font-size:12px; color:var(--hpe-muted); }
+    .vmf-scan-warn { padding:10px 12px; font-size:12px; color:#8a5300; background:#fff3e0; border-top:1px solid #f0c890; }
+    table.vmf-scan-tbl { width:calc(100% - 24px); margin:0 12px 10px; }
+    table.vmf-scan-tbl th { border-bottom:1px solid var(--hpe-border); }
+    .vmf-scan-other { margin:0 12px 12px; font-size:12px; }
+    .vmf-scan-other summary { cursor:pointer; color:var(--hpe-muted); font-size:11px; text-transform:uppercase; letter-spacing:.05em; font-weight:600; padding:4px 0; }
     .vmf-badge-un { display:inline-block; background:#fff3e0; color:#8a5300; border:1px solid #f0c890; border-radius:3px; padding:0 5px; font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:.03em; vertical-align:middle; }
     .vmf-tag { display:inline-block; background:#e6f5f1; color:var(--hpe-green-dark); border-radius:3px; padding:1px 7px; font-size:11px; font-weight:500; border:1px solid #b3e0d5; }
     .vmf-act { padding:3px 8px; font-size:11px; border:1px solid var(--hpe-border); border-radius:3px; background:#fff; cursor:pointer; color:var(--hpe-text); text-decoration:none; display:inline-flex; align-items:center; }
