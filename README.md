@@ -1,182 +1,160 @@
-# VM Folders — HPE Morpheus Plugin
+# morpheus-vm-folders-plugin
 
-Folder organization for VMs in HPE Morpheus VM Essentials. Organize, browse, and control virtual machines across clouds.
+vCenter-style folder organization for HPE VM Essentials / Morpheus VMs.
 
-![VM Folders Screenshot](docs/screenshot.png)
+A drop-in plugin that adds a **VM Folders** dashboard to Morpheus plus embedded
+tabs on cluster, host and instance detail pages. No core modifications, no
+Morpheus database schema changes, no appliance restart.
 
----
+Current version: **1.3.6** · target platform: **Morpheus 9.0.2** · plugin API **1.3.0**
+
+## What it does
+
+- **Standalone dashboard** at `/plugin/vmFolders` — folder tree on the left, VM
+  table on the right, with search, sort, multi-select and bulk move
+- **Embedded tabs** (read-only) on Infrastructure → Clusters, Infrastructure →
+  Compute → Hosts, and Provisioning → Instances detail pages
+- **Datastore view** — a Datastore column, per-VM disk detail rows, and a
+  read-only sidebar section for browsing VMs by the datastore their disks are on
+- **Auto-Organize** — builds a Cloud/Host folder hierarchy and assigns every VM
+- **Re-sync Hosts** — updates Cloud/Host folder assignments after a live migration
+- **Power actions and console** links inline in the VM table
+- **Backup / Restore / Export** of the folder database
 
 ## Features
 
-### Core (v1.0.0)
-- **Folder tree** — create, rename, delete, collapse/expand folders
-- **VM table** — NAME, STATUS, OS, MEMORY, vCPU, IP, CLOUD, FOLDER, ACTIONS
-- **Power control** — Start / Stop per VM via Morpheus API
-- **Console access** — opens Morpheus hypervisor console in a new tab
-- **Search & sort** — filter VMs by name, IP, OS, cloud
-- **Multi-select move** — assign multiple VMs to a folder at once
-- **Backup / Restore / Export** — JSON database snapshots
-- **Log viewer** — plugin event log with export
-- **Dark / light theme** — auto-syncs to Morpheus UI dark mode setting
-- **HPE branding** — HPE green (#01A982), standard header (#425563)
+- Nested folder paths (e.g. `/Production/Web`, `/Dev/Databases`)
+- Create, rename and delete folders; move VMs singly or in bulk
+- Cloud filter chips; host and cluster context applied automatically in tabs
+- Datastore browsing with a **No datastore** bucket for VMs that have none
+- `unmanaged` badge on VMs discovered on the hypervisor rather than provisioned
+  by Morpheus — labelled only, all actions remain available
+- Live search across name, IP, OS, cloud and datastore
+- Dark mode that follows the Morpheus theme
+- Tenant-scoped: users only ever see VMs their account can access
 
-### v1.1.0
-- **Cloud tabs** — All | cloud1 | cloud2 above the folder tree, auto-populated from loaded VMs
-- **Cloud context auto-detection** — reads the Morpheus page DOM to auto-select the correct cloud when viewing from a host or cluster tab
-- **Embedded tab providers:**
-  - **Infrastructure → Clusters → (cluster) → VM Folders** — read-only view scoped to that cluster
-  - **Infrastructure → Compute → Hosts → (host) → VM Folders** — read-only view scoped to that host with Re-sync button
-  - **Provisioning → Instances → (instance) → VM Folders** — shows folder membership with quick-assign
-- **Navigation injection:**
-  - **Infrastructure sub-nav** — VM Folders link after Boot
-  - **Provisioning sub-nav** — VM Folders link after Code
-  - **Provisioning hover dropdown** — VM Folders in the flyout menu
-  - **Infrastructure → Clouds detail** — VM Folders tab on cloud detail pages
-- **Auto-Organize** — one-click Cloud → Host folder hierarchy with automatic VM assignment
-- **Re-sync Hosts** — updates folder assignments after VME live-migrates VMs between hosts
-- **Read-only embedded tabs** — cluster/server/instance tabs hide edit, delete, move controls
-- **Dark mode auto-sync** — CSS variable injection that survives React re-renders
-- **Start/Stop buttons** — white text on solid green/red, visible without hover
+## How folder data is stored
 
----
+Folder definitions and VM→folder assignments live in a **JSON file on the
+appliance**, not in the Morpheus database and not as VM metadata:
+
+```
+/var/opt/morpheus/morpheus-ui/plugins/vm-folders.json
+/var/opt/morpheus/morpheus-ui/plugins/vm-folders.json.bak
+```
+
+Writes are serialized through a single lock (read-modify-write under one
+`mutateDb`), `fsync`ed, and committed with an atomic rename. `Restore` parses the
+backup before replacing the live file. Removing the plugin leaves the JSON file
+behind and touches nothing in Morpheus.
+
+Trade-off: because assignments are keyed by compute server id in a plugin-owned
+file, they are not visible to the Morpheus API or to other plugins. Use
+**Export** for an external copy.
 
 ## Requirements
 
 | Component | Version |
 |---|---|
-| HPE Morpheus VM Essentials | 8.1.0+ (tested 8.1.1, 8.8) |
-| morpheus-plugin-api | 1.3.0 |
-| Java | 11 |
-| Gradle | 7.6.4 |
+| Morpheus / VM Essentials | 9.0.2 (developed against; 8.x untested since 1.1.0) |
+| `morpheus-plugin-api` | 1.3.0 |
+| Java (build) | 17 (source/target 11) |
+| Gradle | 8.8 — Shadow 8.1.1 requires Gradle 8+ |
 
----
+## Build
 
-## Installation
-
-1. Download the latest `.jar` from [Releases](../../releases)
-2. In Morpheus: **Administration → Integrations → Plugins → Upload Plugin**
-3. Upload `morpheus-vm-folders-plugin-{version}-all.jar`
-4. Plugin activates immediately — no restart required
-
-Database file auto-created at:
-```
-/var/opt/morpheus/morpheus-ui/plugins/vm-folders.json
-```
-
----
-
-## Building from Source
+No Gradle wrapper is checked in; use a local Gradle 8.x.
 
 ```bash
-sdk use gradle 7.6.4
-export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
-
-git clone https://github.com/builtbyfood/morpheus-vm-folders
-cd morpheus-vm-folders
-gradle shadowJar --no-daemon
-# → build/libs/morpheus-vm-folders-plugin-{version}-all.jar
+gradle clean shadowJar
 ```
 
----
+Output: `build/libs/morpheus-vm-folders-plugin-1.3.6-all.jar`
 
-## Usage
+Morpheus compiles Groovy plugins when it loads them, so a successful Gradle build
+does not prove the plugin compiles against the running appliance. Always check the
+log after uploading:
 
-### Standalone Page
-Navigate to `https://your-morpheus/plugin/vmFolders`
-
-Also accessible from:
-- Infrastructure sub-nav → VM Folders
-- Provisioning sub-nav → VM Folders
-- Provisioning hover dropdown → VM Folders
-
-### Embedded Tabs
-VM Folders appears as a native tab on:
-- **Infrastructure → Clusters → (cluster)** — cluster VMs filtered to cloud
-- **Infrastructure → Compute → Hosts → (host)** — VMs on that host + Re-sync
-- **Infrastructure → Clouds → (cloud)** — injected via JavaScript
-- **Provisioning → Instances → (instance)** — folder membership + assign
-
-### Cloud Tabs
-The folder tree header shows **All | cloud1 | cloud2** tabs.
-- In embedded tabs the correct cloud is auto-selected from Morpheus page context
-- In the standalone page click a tab to filter
-
-### Auto-Organize
-The ⚙ Auto-Organize button creates a Cloud → Host hierarchy and assigns all VMs:
-```
-/liber-tea/vme1/
-/liber-tea/vme2/
-/vmware/esxi1/
+```bash
+sudo grep -i -A15 "VmFolders" /var/log/morpheus/morpheus-ui/current | tail -80
 ```
 
-### Re-sync Hosts
-After VME live-migrates a VM, click **↺ Re-sync** (host tab header or `GET /plugin/vmFolders/resync`) to update folder assignments to match current host locations.
+Expect `VM Folders Plugin 1.3.6 initialized`.
 
----
+## Install
 
-## Architecture
+1. Log into Morpheus as an administrator
+2. **Administration → Plugins → + Add Plugin**, upload the `.jar`
+3. **VM Folders** appears in the Infrastructure and Provisioning sub-navigation,
+   and the dashboard is reachable at `/plugin/vmFolders`
+
+## Security model
+
+- **Mutations are POST only.** Every state-changing route passes through
+  `requireMutation()`: POST verb, a required `X-VMF-Request` header, an
+  Origin/Referer host match when either header is present, and an authenticated
+  user. GET on a mutating route returns `405 {"success":false,"error":"POST required"}`.
+- **Morpheus core CSRF is honored.** Core runs Spring Security CSRF in front of
+  `/plugin/*`; the plugin sends the session token as `X-XSRF-TOKEN`, read from
+  `<meta name="_csrf">` on core pages or, for the standalone dashboard, by
+  fetching one core page once per load (all core cookies are HttpOnly).
+- **Tenant scoping.** VM queries use `DataQuery(user)` *and* an explicit
+  per-record `canAccess()` filter; the master account is exempt. Acting on
+  another tenant's VM id returns 404.
+- **Output escaping.** Every user- or platform-supplied string rendered into the
+  page goes through `esc()`. Handlebars templates pass model values via `data-*`
+  attributes and never interpolate them into JavaScript string literals.
+
+Routes are currently gated on the `admin-cm: full` permission. To widen access,
+change the `Permission.build(...)` call in `VmFoldersController.getRoutes()` —
+note that read and write routes presently share one permission.
+
+## Support helper
+
+On any VM Folders page, run this in the browser console for the full client state
+(counts, active filters, scraped vs. applied cloud, host context, script instance
+count). It reads state only:
+
+```js
+vmfState()
+```
+
+## Project layout
 
 ```
-src/
-├── assets/javascript/
-│   └── vmFolders.js                        # Full SPA + nav injection + dark mode
-├── main/
-│   ├── groovy/com/morpheusdata/vmfolders/
-│   │   ├── VmFoldersPlugin.groovy          # Entry point, provider registration
-│   │   ├── VmFoldersController.groovy      # SPA page + all API endpoints
-│   │   ├── VmFoldersNavProvider.groovy     # GlobalUIComponentProvider
-│   │   ├── VmFoldersClusterTabProvider.groovy
-│   │   ├── VmFoldersServerTabProvider.groovy
-│   │   └── VmFoldersInstanceTabProvider.groovy
-│   └── resources/renderer/hbs/
-│       ├── vmFoldersNav.hbs               # CSS variables on every page
-│       ├── vmFoldersClusterTab.hbs
-│       ├── vmFoldersServerTab.hbs
-│       └── vmFoldersInstanceTab.hbs
+src/main/groovy/com/morpheusdata/vmfolders/
+  VmFoldersPlugin.groovy             plugin entry; registers providers
+  VmFoldersController.groovy         all routes, JSON DB layer, dashboard HTML/CSS
+  VmFoldersNavProvider.groovy        injects vmFolders.js into every core page
+  VmFoldersClusterTabProvider.groovy
+  VmFoldersServerTabProvider.groovy
+  VmFoldersInstanceTabProvider.groovy
+src/assets/javascript/vmFolders.js   SPA: tree, table, datastore view, mutations
+src/main/resources/renderer/hbs/     tab templates
 ```
 
-### API Endpoints (`/plugin/vmFolders/...`)
+`vmFolders.js` is an IIFE with a single-instance guard; only functions assigned to
+`window.*` are reachable from templates or the console.
 
-| Endpoint | Description |
-|---|---|
-| `GET /` | Standalone SPA page |
-| `GET /vms` | All compute servers (proxied) |
-| `GET /db` | Current folder/assignment database |
-| `POST /saveFolder` | Create or update folder |
-| `POST /delFolder` | Delete folder |
-| `POST /renFolder` | Rename folder |
-| `POST /assign` | Assign VM to folder |
-| `POST /unassign` | Remove VM from folder |
-| `GET /power` | Start / Stop / Restart |
-| `GET /resync` | Re-sync host assignments |
-| `GET /serverActions` | Available actions for a server |
-| `POST /backup` | Download DB backup |
-| `POST /restore` | Restore DB from backup |
-| `GET /export` | Export DB as JSON |
-| `GET /logs` | Plugin log entries |
+## Known limitations
 
----
+- **One permission for read and write.** All routes require `admin-cm: full`;
+  there is no separate read-only role, and no per-folder RBAC — every user who can
+  open the page sees every folder in their tenant.
+- **Folder names are not tenant-scoped** in the folder list: assignments are
+  filtered by tenant, but stored folder *names* are returned to any caller.
+- **Cloud detail tab and sub-nav links are DOM-injected**, because plugin API
+  1.3.0 has no cloud tab provider. They depend on Morpheus markup and can break
+  on a UI change.
+- **Datastore view is read-only** — it filters the table; it never creates folders
+  or writes assignments.
+- **`usedStorage` is reported as 0** by VME/KVM volumes, so disk detail rows show
+  `—` for used space.
+- **SPA navigation** does not always reset client state between tabs.
+- No automated tests; verification is the manual checklist in `CLAUDE.md`.
 
-## Known Limitations
+## Changelog
 
-- **No `AbstractCloudTabProvider`** in API 1.3.0 — cloud detail tab uses JS injection instead
-- **VMware console** — uses Morpheus hypervisor proxy; native VMware HTML Console SDK planned for v1.2.0
-- **Per-cloud folder namespacing** — cloud tabs are a UI filter; true isolation planned for v1.2.0
-- **VME Migrator conflict** — if VME Migrator's `MigrationController` throws `MissingPropertyException: Permission` it breaks all plugin routes; fix by rebuilding VME Migrator with the correct `Permission` import
-
----
-
-## Roadmap
-
-### v1.2.0
-- Per-cloud folder namespacing (JSON schema v2)
-- VMware HTML Console SDK integration
-- XML Editor plugin integration (auto-detect when installed)
-- Column resizing with localStorage persistence
-
----
-
-## Author
-
-Travis DeLuca — [@builtbyfood](https://github.com/builtbyfood)  
-Built for the HPE Morpheus community.
+See [CHANGELOG.md](CHANGELOG.md). Notable releases: **1.1.5** (security
+hardening, core CSRF, embedded-tab fixes), **1.2.0** (datastore visibility and
+browsing), **1.3.6** (unmanaged labelling, datastore bucket fix, embedded-tab state fixes).

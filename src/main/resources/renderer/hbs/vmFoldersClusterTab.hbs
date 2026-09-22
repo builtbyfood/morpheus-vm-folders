@@ -38,15 +38,21 @@
   #vmf-ct .vmf-act { padding:2px 7px !important; font-size:11px !important; border:1px solid var(--hpe-border,#CCCCCC) !important; border-radius:3px !important; background:var(--hpe-white,#fff) !important; cursor:pointer !important; color:var(--hpe-text,#333) !important; font-family:-apple-system,sans-serif !important; line-height:1.4 !important; min-height:0 !important; height:auto !important; }
   #vmf-ct .vmf-act:hover { border-color:#01A982 !important; color:#008567 !important; }
   #vmf-ct .vmf-pw-btn { color:#fff !important; }
+  #vmf-ct .vmf-start-btn { background:#01A982 !important; border-color:#008567 !important; color:#fff !important; padding:2px 7px !important; font-size:11px !important; border-radius:3px !important; line-height:1.4 !important; }
+  #vmf-ct .vmf-stop-btn  { background:#c00    !important; border-color:#a00    !important; color:#fff !important; padding:2px 7px !important; font-size:11px !important; border-radius:3px !important; line-height:1.4 !important; }
+  #vmf-ct .vmf-start-btn:hover { background:#008567 !important; }
+  #vmf-ct .vmf-stop-btn:hover  { background:#a00    !important; }
   #vmf-ct .vmf-empty, #vmf-ct .vmf-spin { display:flex; align-items:center; justify-content:center; padding:30px; color:var(--hpe-muted,#767676); font-family:-apple-system,sans-serif; gap:8px; font-size:12px; }
   #vmf-ct .vmf-spinner { width:14px; height:14px; border:2px solid var(--hpe-border,#CCCCCC); border-top-color:#01A982; border-radius:50%; animation:vmfCtSpin .7s linear infinite; }
   @keyframes vmfCtSpin { to { transform:rotate(360deg); } }
+  .vmf-badge-un { display:inline-block; background:#fff3e0; color:#8a5300; border:1px solid #f0c890; border-radius:3px; padding:0 5px; font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:.03em; vertical-align:middle; }
+  body.dark .vmf-badge-un { background:#3A2E1A; color:#E0B870; border-color:#5A4828; }
 </style>
 
-<div id="vmf-ct">
+<div id="vmf-ct" data-server-id="{{serverId}}" data-server-name="{{serverName}}" data-cloud-name="{{cloudName}}">
   <div id="vmf-ct-hdr">
     <span class="title">VM Folders</span>
-    <span style="font-size:11px;color:#B0BEC5;">{{object.serverName}}</span>
+    <span style="font-size:11px;color:#B0BEC5;">{{serverName}}</span>
     <a href="/plugin/vmFolders" target="_blank" class="vmf-cl-btn" style="margin-left:auto;">Open Full View ↗</a>
   </div>
   <div class="vmf-main">
@@ -68,11 +74,29 @@
 
 <script nonce="{{nonce}}">
   window.vmfReadOnly = true;
-  window.vmfContextCloud = '{{object.cloudName}}';
+  window.vmfContextCloud = (function() {
+    // Model value comes from a data-* attribute on #vmf-ct (never interpolate into JS literals)
+    var ctEl = document.getElementById('vmf-ct');
+    var fromModel = (ctEl && ctEl.dataset && ctEl.dataset.cloudName) || '';
+    if (fromModel && fromModel !== 'null' && fromModel !== 'undefined' && fromModel !== '') return fromModel;
+    try {
+      // Prefer the label-aware detection shared in vmFolders.js: a link-only match
+      // also hits the Group row, which put a group name in the cloud filter.
+      if (typeof window.vmfDetectContextCloud === 'function') {
+        var labelled = window.vmfDetectContextCloud();
+        if (labelled) return labelled;
+      }
+      var ic = document.querySelector('.info-column a[href*="/infrastructure/clouds/"]');
+      if (ic) return ic.textContent.trim();
+      var all = document.querySelectorAll('a[href*="/infrastructure/clouds/"]');
+      for (var i = 0; i < all.length; i++) {
+        if (!all[i].closest('nav, header, #main-nav, .main-nav, .navbar')) return all[i].textContent.trim();
+      }
+    } catch(e) {}
+    return '';
+  })();
   (function() {
-    // Rename wrapper to expected ID
-    var wrap = document.getElementById('vmf-ct');
-    if (wrap) wrap.id = 'vmf-cluster-tab-wrap';
+
     if (typeof vmfReload === 'function') {
       vmfReload();
     } else {

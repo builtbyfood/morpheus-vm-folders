@@ -1,8 +1,31 @@
 (function() {
+  // Single-instance guard. VmFoldersNavProvider injects this script on every core
+  // page AND each tab template re-injects it when vmfReload is not yet defined, so
+  // two IIFEs could run with separate allVms/storedFolders while sharing the DOM and
+  // both listening on document — one would render its empty state over the other's.
+  window.__vmfInstances = (window.__vmfInstances || 0) + 1;
+  if (window.__vmfLoaded) {
+    try { console.warn('vmFolders: already loaded ('+window.__vmfInstances+' instances requested), skipping duplicate'); } catch(e) {}
+    return;
+  }
+  window.__vmfLoaded = true;
+
   var ROOT = '/';
   var allVms = [], storedFolders = [], activeFolder = '__all__', searchQ = '';
   var selectedIds = new Set(), sortCol = 'name', sortAsc = true;
   var cloudFilter = '__all__';
+  // Datastore browsing (read-only): a datastore name, NO_DS for "no datastore", or null.
+  // Folder selection and datastore selection are mutually exclusive — see resetSelection().
+  var NO_DS = '__none__';
+  var activeDatastore = null;
+
+  // Single reset path for the sidebar selection state so folder and datastore
+  // views can never both be active (and so a future SPA-navigation reset has one hook).
+  function resetSelection(folderKey, dsKey) {
+    activeFolder = folderKey || '__all__';
+    activeDatastore = dsKey || null;
+    selectedIds.clear();
+  }
 
   // Expose syncDarkMode globally so it can be called from HBS templates
   window.vmfSyncDark = function() {
@@ -44,6 +67,29 @@
     }
   }
   var API = window.vmfApiBase || '/plugin/vmFolders';
+
+  // Cloud name for an embedded tab, read from the Morpheus detail page.
+  // Link-only matching ('a[href*="/infrastructure/clouds/"]') also matches the GROUP
+  // row on host/cluster pages, which is how a group name ended up as the cloud filter.
+  // Prefer the row whose own label says "Cloud"; fall back to a link, and let
+  // activeCloudName() discard anything that matches no loaded VM.
+  window.vmfDetectContextCloud = function() {
+    try {
+      var rows = document.querySelectorAll('.info-column li, .info-column tr, .info-column .detail-row, .info-column dl > div');
+      for (var i = 0; i < rows.length; i++) {
+        var row = rows[i];
+        var labelEl = row.querySelector('label, .label, dt, th, .detail-label');
+        var label = (labelEl && labelEl.textContent || '').trim();
+        if (!/^cloud\b/i.test(label)) continue;
+        var a = row.querySelector('a[href*="/infrastructure/clouds/"]');
+        if (a && a.textContent.trim()) return a.textContent.trim();
+        var valEl = row.querySelector('.value, dd, td:last-child, span:last-child');
+        var val = (valEl && valEl.textContent || '').replace(/^\s*cloud\s*:?\s*/i, '').trim();
+        if (val) return val;
+      }
+    } catch (e) {}
+    return '';
+  };
 
   // ── Tab injection ──────────────────────────────────────────────────
   // v1.1.0: Tab injection removed for compute pages
@@ -135,6 +181,87 @@
     return r.json();
   }
 
+  // ── CSRF token ─────────────────────────────────────────────────────
+  // Morpheus core runs Spring Security CSRF in front of /plugin/*: every POST
+  // must carry the session token as an X-XSRF-TOKEN header (or a _csrf form
+  // field) or core answers 302 → /error/invalid-csrf before the plugin sees it.
+  // Core pages expose the token as <meta name="_csrf">. The standalone
+  // dashboard is not a core page, so it falls back to a readable cookie, then
+  // to fetching one core page and scraping the meta tag. Cached per page load.
+  var CSRF_HEADER_DEFAULT = 'X-XSRF-TOKEN';
+  var csrfCache = null;          // { header: 'X-XSRF-TOKEN', token: '...' }
+  var csrfFetchPromise = null;   // in-flight scrape, so concurrent posts share it
+
+  function csrfFromMeta(doc) {
+    var m = (doc || document).querySelector('meta[name="_csrf"]');
+    if (!m || !m.content) return null;
+    var h = (doc || document).querySelector('meta[name="_csrf_header"]');
+    return { header: (h && h.content) || CSRF_HEADER_DEFAULT, token: m.content };
+  }
+
+  // Standalone page only: pull a lightweight core page and read its meta tag.
+  // Core's cookies are all HttpOnly, so document.cookie is empty here; this is
+  // the only way the standalone dashboard can obtain the token.
+  async function csrfFromCorePage() {
+    if (csrfFetchPromise) return csrfFetchPromise;
+    csrfFetchPromise = (async function() {
+      var pages = ['/operations/dashboard', '/'];
+      for (var i = 0; i < pages.length; i++) {
+        try {
+          var r = await fetch(pages[i], { credentials: 'same-origin', redirect: 'follow', headers: { Accept: 'text/html' } });
+          if (!r.ok) continue;
+          var doc = new DOMParser().parseFromString(await r.text(), 'text/html');
+          var t = csrfFromMeta(doc);
+          if (t) return t;
+        } catch (e) { /* try the next page */ }
+      }
+      return null;
+    })();
+    try { return await csrfFetchPromise; }
+    finally { csrfFetchPromise = null; }
+  }
+
+  async function getCsrf(force) {
+    if (csrfCache && !force) return csrfCache;
+    csrfCache = csrfFromMeta() || await csrfFromCorePage();
+    if (!csrfCache) console.warn('vmFolders: no CSRF token found; core will reject POSTs');
+    return csrfCache;
+  }
+
+  function csrfRejected(r) {
+    // fetch follows the 302; the landing URL is what tells us core refused it
+    return !!(r.redirected && /invalid-csrf/.test(r.url));
+  }
+
+  // All state-changing calls go through here: POST + custom header + core's
+  // CSRF token. The plugin rejects GET and any request without X-VMF-Request;
+  // core rejects anything without a valid token. One retry with a fresh token.
+  async function post(path, params) {
+    var body = new URLSearchParams();
+    Object.keys(params || {}).forEach(function(k) {
+      if (params[k] !== undefined && params[k] !== null) body.append(k, String(params[k]));
+    });
+    var bodyStr = body.toString();
+
+    async function send(csrf) {
+      var headers = {
+        Accept: 'application/json',
+        'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+        'X-VMF-Request': '1'
+      };
+      if (csrf) headers[csrf.header] = csrf.token;
+      return fetch(API + path, { method: 'POST', credentials: 'same-origin', headers: headers, body: bodyStr });
+    }
+
+    var r = await send(await getCsrf(false));
+    if (csrfRejected(r)) r = await send(await getCsrf(true));
+    if (csrfRejected(r)) return { success: false, error: 'rejected by server CSRF check (reload the page and retry)' };
+    try { return await r.json(); }
+    catch (e) { return { success: false, error: 'HTTP ' + r.status }; }
+  }
+  // Shared with the HBS tab templates so they use the same token logic.
+  window.vmfPost = post;
+
   async function fetchAll() {
     var results = await Promise.all([get('/vms'), get('/db')]);
     allVms = results[0].servers || [];
@@ -150,7 +277,7 @@
     // Apply all active filters to determine visible VMs
     var srcVms = allVms;
     if (window.vmfHostId) srcVms = srcVms.filter(function(vm){ return String(vm.hostId||'') === String(window.vmfHostId); });
-    var activeCloud = (cloudFilter !== '__all__') ? cloudFilter : (window.vmfContextCloud || null);
+    var activeCloud = activeCloudName();
     if (activeCloud) srcVms = srcVms.filter(function(vm){ return (vm.cloudName||'') === activeCloud; });
 
     // Build set of paths from visible VMs
@@ -169,11 +296,92 @@
   }
 
   function countIn(path) {
-    var src = allVms;
+    return scopedVms().filter(function(vm){var p=getVmFolder(vm); return p===path||p.startsWith(path+'/');}).length;
+  }
+
+  // The active cloud filter, but ONLY if it names a cloud present in the loaded data.
+  // window.vmfContextCloud is scraped from the Morpheus DOM by the tab templates; when
+  // that scrape returns a label that is not a cloud name (or a name that no longer
+  // matches after a reload) an unvalidated filter silently empties every view — the
+  // folder tree included, which is why "No folders yet" appeared on the host tab.
+  function activeCloudName() {
     var ac = (cloudFilter !== '__all__') ? cloudFilter : (window.vmfContextCloud || null);
+    if (!ac) return null;
+    var known = allVms.some(function(vm){ return (vm.cloudName||'') === ac; });
+    if (!known) {
+      try { console.warn('vmFolders: ignoring cloud filter "'+ac+'" — no VM reports that cloud'); } catch(e) {}
+      return null;
+    }
+    return ac;
+  }
+
+  // VMs narrowed by the cloud chips and host context only (no folder/datastore/search).
+  function scopedVms() {
+    var src = allVms;
+    var ac = activeCloudName();
     if (ac) src = src.filter(function(vm){ return (vm.cloudName||'') === ac; });
     if (window.vmfHostId) src = src.filter(function(vm){ return String(vm.hostId||'') === String(window.vmfHostId); });
-    return src.filter(function(vm){var p=getVmFolder(vm); return p===path||p.startsWith(path+'/');}).length;
+    return src;
+  }
+
+  // ── Datastores (derived client-side from /vms; tenant scoping already applied server-side) ──
+  function vmDisks(vm) { return Array.isArray(vm.disks) ? vm.disks : []; }
+  function vmDatastoreNames(vm) { return Array.isArray(vm.datastores) ? vm.datastores : []; }
+
+  function vmOnDatastore(vm, key) {
+    // "No datastore" is VMs with no datastore AT ALL (including VMs with no disks) —
+    // not VMs that merely have one disk without one. A mixed VM (a datastore-backed
+    // disk plus, say, a mounted ISO) belongs to its real datastores; the null-datastore
+    // disk shows as — in the expanded detail row, which is the right place for it.
+    if (key === NO_DS) return vmDatastoreNames(vm).length === 0;
+    return vmDatastoreNames(vm).indexOf(key) !== -1;
+  }
+
+  // { name: {vms, disks} } plus a NO_DS bucket, using the same membership rule as
+  // vmOnDatastore() so a count can never disagree with what clicking it lists.
+  // A VM with disks on two datastores counts in both.
+  function datastoreStats() {
+    var stats = {};
+    function bucket(k) { if (!stats[k]) stats[k] = { vms: 0, disks: 0 }; return stats[k]; }
+    scopedVms().forEach(function(vm) {
+      var names = vmDatastoreNames(vm);
+      if (!names.length) {
+        var b = bucket(NO_DS);
+        b.vms++;
+        b.disks += vmDisks(vm).length;   // zero for a VM with no disks at all
+        return;
+      }
+      names.forEach(function(n) { bucket(n).vms++; });
+      vmDisks(vm).forEach(function(d) {
+        if (d.datastore) bucket(d.datastore).disks++;
+      });
+    });
+    return stats;
+  }
+
+  function renderDatastores() {
+    var el = document.getElementById('vmf-dslist'), head = document.getElementById('vmf-ds-head');
+    if (!el) return;                       // embedded tabs have no datastore section
+    var stats = datastoreStats();
+    var names = Object.keys(stats).filter(function(k){ return k !== NO_DS; }).sort();
+    if (!names.length && !stats[NO_DS]) { el.style.display = 'none'; if (head) head.style.display = 'none'; return; }
+    el.style.display = ''; if (head) head.style.display = '';
+    var html = '';
+    names.forEach(function(n) { html += dsItem(n, n, stats[n]); });
+    if (stats[NO_DS]) {
+      if (names.length) html += '<div class="vmf-divider"></div>';
+      html += dsItem(NO_DS, 'No datastore', stats[NO_DS]);
+    }
+    el.innerHTML = html;
+  }
+
+  function dsItem(key, label, st) {
+    var active = activeDatastore === key;
+    var tip = st.vms + ' VM' + (st.vms!==1?'s':'') + ', ' + st.disks + ' disk' + (st.disks!==1?'s':'') + ' — a VM with disks on several datastores is counted in each';
+    return '<div class="vmf-fi' + (active ? ' active' : '') + '" data-ds-key="' + esc(key) + '" title="' + esc(tip) + '">' +
+      '<span class="vmf-fi-icon">&#128451;</span>' +
+      '<span class="vmf-fi-name">' + esc(label) + '</span>' +
+      '<span class="vmf-fi-count">' + st.vms + '</span></div>';
   }
 
   function isStored(path) { return storedFolders.some(function(f) { return f.path === path; }); }
@@ -196,7 +404,7 @@
         e.stopPropagation();
         cloudFilter = cloud;
         window.vmfContextCloud = cloud==='__all__' ? null : cloud;
-        renderCloudBar(); renderTree(); renderVms();
+        renderCloudBar(); renderTree(); renderDatastores(); renderVms();
       });
       bar.appendChild(btn);
     }
@@ -208,9 +416,23 @@
     return 'padding:2px 8px;border-radius:10px;font-size:11px;font-weight:'+(active?'600':'400')+';cursor:pointer;border:1px solid '+(active?'var(--hpe-green-dark,#008567)':'var(--hpe-border,#CCCCCC)')+';background:'+(active?'var(--hpe-green,#01A982)':'transparent')+';color:'+(active?'#fff':'var(--hpe-muted,#767676)')+';font-family:-apple-system,sans-serif;white-space:nowrap;line-height:1.4;';
   }
 
+  // Read-only state dump for support: type vmfState() in the console. Kept out of the
+  // render path so nothing is logged during normal use.
+  window.vmfState = function() {
+    return {
+      instances: window.__vmfInstances || 1,
+      allVms: allVms.length, scoped: scopedVms().length, filtered: getFiltered().length,
+      storedFolders: storedFolders.length, paths: allPaths().length,
+      activeFolder: activeFolder, activeDatastore: activeDatastore,
+      cloudFilter: cloudFilter, contextCloud: window.vmfContextCloud || null, cloudUsed: activeCloudName(),
+      hostId: window.vmfHostId || null, readOnly: !!window.vmfReadOnly,
+      clouds: Array.from(new Set(allVms.map(function(vm){ return vm.cloudName||''; }))).sort()
+    };
+  };
+
   function renderTree() {
     var paths = allPaths();
-    var html = treeItem('__all__', '&#128196;', 'All VMs', allVms.length, 0, null, false);
+    var html = treeItem('__all__', '&#128196;', 'All VMs', scopedVms().length, 0, null, false);
     html += '<div class="vmf-divider"></div>';
     if (!paths.length) {
       html += '<div style="padding:10px 14px;color:#767676;font-size:12px;line-height:1.6">No folders yet.<br>Click <b>+ Folder</b> to create one.</div>';
@@ -221,7 +443,7 @@
         html += treeItem(p, '&#128193;', name, countIn(p), depth > 1 ? (depth-1)*16 : 0, p, isStored(p));
       });
     }
-    var unorg = allVms.filter(function(vm) { return getVmFolder(vm) === ROOT; }).length;
+    var unorg = scopedVms().filter(function(vm) { return getVmFolder(vm) === ROOT; }).length;
     if (unorg > 0) {
       html += '<div class="vmf-divider"></div>';
       html += treeItem(ROOT, '&#128220;', 'Unorganized', unorg, 0, null, false);
@@ -231,7 +453,7 @@
   }
 
   function treeItem(key, icon, name, count, indent, fullPath, stored) {
-    var active = activeFolder === key;
+    var active = !activeDatastore && activeFolder === key;
     var cls = 'vmf-fi' + (active ? ' active' : '');
     var style = indent ? ' style="padding-left:' + (14 + indent) + 'px"' : '';
     var title = fullPath ? ' title="' + esc(fullPath) + '"' : '';
@@ -253,9 +475,11 @@
     var ren = e.target.closest('[data-rename]');
     var del = e.target.closest('[data-delfolder]');
     var fi  = e.target.closest('[data-folder-key]');
+    var di  = e.target.closest('[data-ds-key]');
     if (ren) { e.stopPropagation(); vmfRenameFolder(ren.getAttribute('data-rename')); return; }
     if (del) { e.stopPropagation(); vmfDeleteFolder(del.getAttribute('data-delfolder')); return; }
-    if (fi)  vmfSelectFolder(fi.getAttribute('data-folder-key'));
+    if (fi)  { vmfSelectFolder(fi.getAttribute('data-folder-key')); return; }
+    if (di)  vmfSelectDatastore(di.getAttribute('data-ds-key'));
   });
   document.addEventListener('change', function(e) {
     if (e.target && e.target.id === 'vmf-cloud-filter') { cloudFilter = e.target.value; renderVms(); }
@@ -263,10 +487,11 @@
 
   // ── VM table ───────────────────────────────────────────────────────
   function getFiltered() {
-    var vms = activeFolder === '__all__' ? allVms.slice() :
+    var vms = activeDatastore ? allVms.filter(function(vm) { return vmOnDatastore(vm, activeDatastore); }) :
+              activeFolder === '__all__' ? allVms.slice() :
               activeFolder === ROOT ? allVms.filter(function(vm) { return getVmFolder(vm) === ROOT; }) :
               allVms.filter(function(vm) { var p = getVmFolder(vm); return p === activeFolder || p.startsWith(activeFolder + '/'); });
-    var ac = (cloudFilter !== '__all__') ? cloudFilter : (window.vmfContextCloud || null);
+    var ac = activeCloudName();
     if (ac) vms = vms.filter(function(vm){ return (vm.cloudName||'') === ac; });
     if (window.vmfHostId) vms = vms.filter(function(vm){ return String(vm.hostId||'') === String(window.vmfHostId); });
     if (searchQ) {
@@ -274,14 +499,21 @@
       vms = vms.filter(function(vm) {
         return (vm.name||'').toLowerCase().includes(q) || (vm.externalIp||'').includes(q) ||
                (vm.internalIp||'').includes(q) || (vm.osType||'').toLowerCase().includes(q) ||
-               (vm.cloudName||'').toLowerCase().includes(q);
+               (vm.cloudName||'').toLowerCase().includes(q) || dsLabel(vm).toLowerCase().includes(q);
       });
     }
     return vms.sort(function(a,b) {
-      var av=String(a[sortCol]||'').toLowerCase(), bv=String(b[sortCol]||'').toLowerCase();
+      var av=sortVal(a), bv=sortVal(b);
       return sortAsc ? (av<bv?-1:av>bv?1:0) : (av>bv?-1:av<bv?1:0);
     });
   }
+  // Sort key for the active column; arrays (datastores) sort on their joined label.
+  function sortVal(vm) {
+    var v = vm[sortCol];
+    if (Array.isArray(v)) return v.join(', ').toLowerCase();
+    return String(v||'').toLowerCase();
+  }
+  function dsLabel(vm) { return Array.isArray(vm.datastores) && vm.datastores.length ? vm.datastores.join(', ') : ''; }
 
   function dot(status) {
     var s = String(status||'').toLowerCase();
@@ -289,56 +521,45 @@
     return '<span class="vmf-dot" style="background:' + c + '"></span>';
   }
   function fmtMem(b) { if(!b) return '—'; var g=b/1073741824; return g>=1?g.toFixed(1)+' GB':Math.round(b/1048576)+' MB'; }
+  // Disk sizes: TB / GB / MB. 0 or null renders as '—' (VME/KVM report usedStorage=0).
+  function fmtMemSmall(b) {
+    b = Number(b||0); if(!b) return '—';
+    var t=b/1099511627776; if(t>=1) return (t>=10?t.toFixed(1):t.toFixed(2))+' TB';
+    var g=b/1073741824;    if(g>=1) return (g>=100?Math.round(g):g.toFixed(1))+' GB';
+    return Math.round(b/1048576)+' MB';
+  }
+  function diskDetailRow(vm) {
+    var disks = vmDisks(vm);
+    if (!disks.length) return '';
+    var rows = disks.map(function(d) {
+      var type = d.type || '';
+      if (d.removable && !/cd|dvd|iso|removable/i.test(type)) type = type ? type + ' (removable)' : 'removable';
+      return '<tr><td>'+esc(d.name||'—')+'</td><td>'+esc(type||'—')+'</td><td>'+esc(d.datastore||'—')+'</td><td>'+fmtMemSmall(d.used)+'</td><td>'+fmtMemSmall(d.total)+'</td><td>'+(d.root?'&#10003;':'')+'</td></tr>';
+    }).join('');
+    return '<tr class="vmf-disk-row" data-disk-for="'+vm.id+'" hidden><td colspan="11">' +
+      '<table class="vmft-sub"><thead><tr><th>Disk</th><th>Type</th><th>Datastore</th><th>Used</th><th>Total</th><th>Root</th></tr></thead><tbody>'+rows+'</tbody></table>' +
+      '</td></tr>';
+  }
 
-  function renderVms() {
-    var vms = getFiltered(), el = document.getElementById('vmf-vlist');
-    if (!el) return;
-    if (!vms.length) {
-      el.innerHTML = '<div class="vmf-empty"><div class="vmf-empty-icon">&#128193;</div><div>' + (searchQ?'No matches.':'Folder is empty.') + '</div></div>';
-      setStatus('0 VMs'); return;
-    }
-    var cols = [['name','Name'],['powerState','Status'],['osType','OS'],['maxMemory','Memory'],['maxCores','vCPU'],['externalIp','IP'],['cloudName','Cloud']];
-    var html = '<table class="vmft"><thead><tr><th style="width:26px"><input type="checkbox" id="vmf-ca"></th>';
-    cols.forEach(function(c) {
-      var s = sortCol===c[0];
-      html += '<th class="'+(s?'sorted':'')+'" data-sort="'+c[0]+'">'+c[1]+(s?(sortAsc?' &#9650;':' &#9660;'):'')+' </th>';
-    });
-    html += '<th>Folder</th><th>Actions</th></tr></thead><tbody>';
-    vms.forEach(function(vm) {
-      var id=vm.id, fp=getVmFolder(vm), sel=selectedIds.has(id);
-      var ip = vm.externalIp||vm.internalIp||'—';
-      var folderLabel = fp===ROOT
-        ? '<span style="color:#767676;font-style:italic;font-size:11px">Unorganized</span>'
-        : '<span class="vmf-tag">'+esc(fp.split('/').filter(Boolean).pop()||'/')+' </span>';
-      var statusStr = String(vm.powerState||'unknown');
-      var isOn = statusStr.toLowerCase().match(/on|running/);
-      html += '<tr class="'+(sel?'sel':'')+'">' +
-        '<td><input type="checkbox" class="vmf-cb" data-id="'+id+'"'+(sel?' checked':'')+' ></td>' +
-        '<td class="vmft-name"><a href="/infrastructure/servers/'+id+'" target="_blank">'+esc(vm.name||'VM-'+id)+'</a></td>' +
-        '<td>'+dot(vm.powerState)+'<span style="vertical-align:middle">'+esc(statusStr)+'</span></td>' +
-        '<td>'+esc((function(o){return(!o||o.includes('@')||o.includes('morpheus'))?'—':o;})(vm.osType))+'</td>' +
-        '<td>'+fmtMem(vm.maxMemory)+'</td>' +
-        '<td>'+(vm.maxCores||'—')+'</td>' +
-        '<td>'+esc(ip)+'</td>' +
-        '<td>'+esc(vm.cloudName||'—')+'</td>' +
-        '<td>'+folderLabel+'</td>' +
-        '<td><div style="display:flex;gap:3px;flex-wrap:wrap">' +
-        (!window.vmfReadOnly ? '<button class="vmf-act vmf-move-btn" data-id="'+id+'">Move</button>' : '') +
-        '<a class="vmf-act vmf-act-console" href="/terminal/server/'+id+'?consoleMode=hypervisor" target="_blank" title="Open console">&#9654;</a>' +
-        (isOn ? '<button class="vmf-act vmf-pw-btn vmf-stop-btn" data-id="'+id+'" data-action="stop" title="Stop VM">&#9632; Stop</button>' : '<button class="vmf-act vmf-pw-btn vmf-start-btn" data-id="'+id+'" data-action="start" title="Start VM">&#9654; Start</button>') +
-        (!window.vmfReadOnly && fp!==ROOT ? '<button class="vmf-act vmf-act-x vmf-rm-btn" data-id="'+id+'" title="Remove from folder">&#10006;</button>' : '') +
-        '</div></td></tr>';
-    });
-    html += '</tbody></table>';
-    el.innerHTML = html;
-
-    var ca = document.getElementById('vmf-ca');
-    if (ca) ca.addEventListener('change', function() { vmfToggleAll(this.checked); });
+  // Listeners are bound ONCE per container. #vmf-vlist persists across renders
+  // (only its innerHTML is replaced), so binding inside renderVms stacked a new
+  // handler on every render: after one folder click the chevron toggled twice
+  // and appeared dead, and sort flipped direction twice. Delegation + a guard flag.
+  function bindVlist(el) {
+    if (el._vmfBound) return;
+    el._vmfBound = true;
     el.addEventListener('change', function(e) {
+      if (e.target.id === 'vmf-ca') { vmfToggleAll(e.target.checked); return; }
       if (e.target.classList.contains('vmf-cb')) vmfToggleSel(parseInt(e.target.dataset.id), e.target.checked);
     });
     el.addEventListener('click', function(e) {
       var mb=e.target.closest('.vmf-move-btn'), rb=e.target.closest('.vmf-rm-btn'), sh=e.target.closest('[data-sort]'), pb=e.target.closest('.vmf-pw-btn');
+      var ch=e.target.closest('[data-chev]');
+      if (ch) {
+        var dr = el.querySelector('tr.vmf-disk-row[data-disk-for="'+ch.getAttribute('data-chev')+'"]');
+        if (dr) { dr.hidden = !dr.hidden; ch.classList.toggle('open', !dr.hidden); }
+        return;
+      }
       if (mb) vmfMoveSingle(parseInt(mb.dataset.id));
       if (rb) vmfRemoveSingle(parseInt(rb.dataset.id));
       if (sh) vmfSort(sh.getAttribute('data-sort'));
@@ -353,7 +574,61 @@
         });
       }
     });
-    setStatus(vms.length+' VM'+(vms.length!==1?'s':'')+(searchQ?' (filtered)':''));
+  }
+
+  function renderVms() {
+    var vms = getFiltered(), el = document.getElementById('vmf-vlist');
+    if (!el) return;
+    if (!vms.length) {
+      el.innerHTML = '<div class="vmf-empty"><div class="vmf-empty-icon">'+(activeDatastore?'&#128451;':'&#128193;')+'</div><div>' + (searchQ?'No matches.':activeDatastore?'No VMs on this datastore.':'Folder is empty.') + '</div></div>';
+      setStatus('0 VMs'); return;
+    }
+    var cols = [['name','Name'],['powerState','Status'],['osType','OS'],['maxMemory','Memory'],['maxCores','vCPU'],['externalIp','IP'],['cloudName','Cloud'],['datastores','Datastore']];
+    var html = '<table class="vmft"><thead><tr><th style="width:26px"><input type="checkbox" id="vmf-ca"></th>';
+    cols.forEach(function(c) {
+      var s = sortCol===c[0];
+      html += '<th class="'+(s?'sorted':'')+'" data-sort="'+c[0]+'">'+c[1]+(s?(sortAsc?' &#9650;':' &#9660;'):'')+' </th>';
+    });
+    html += '<th>Folder</th><th>Actions</th></tr></thead><tbody>';
+    vms.forEach(function(vm) {
+      var id=vm.id, fp=getVmFolder(vm), sel=selectedIds.has(id);
+      var ip = vm.externalIp||vm.internalIp||'—';
+      var folderLabel = fp===ROOT
+        ? '<span style="color:#767676;font-style:italic;font-size:11px">Unorganized</span>'
+        : '<span class="vmf-tag">'+esc(fp.split('/').filter(Boolean).pop()||'/')+' </span>';
+      var statusStr = String(vm.powerState||'unknown');
+      var isOn = statusStr.toLowerCase().match(/on|running/);
+      var hasDisks = vmDisks(vm).length > 0;
+      // Label only — power buttons and actions stay available for unmanaged VMs.
+      var unmanaged = vm.unmanaged === true;
+      var chev = hasDisks ? '<span class="vmf-chev" data-chev="'+id+'" title="Show disks">&#9654;</span>' : '<span class="vmf-chev-none"></span>';
+      html += '<tr class="'+(sel?'sel':'')+'">' +
+        '<td><input type="checkbox" class="vmf-cb" data-id="'+id+'"'+(sel?' checked':'')+' ></td>' +
+        '<td class="vmft-name">'+chev+'<a href="/infrastructure/servers/'+id+'" target="_blank">'+esc(vm.name||'VM-'+id)+'</a>' +
+        (unmanaged ? ' <span class="vmf-badge-un" title="Discovered on the hypervisor, not provisioned by Morpheus">unmanaged</span>' : '') + '</td>' +
+        '<td>'+dot(vm.powerState)+'<span style="vertical-align:middle">'+esc(statusStr)+'</span></td>' +
+        '<td>'+esc((function(o){return(!o||o.includes('@')||o.includes('morpheus'))?'—':o;})(vm.osType))+'</td>' +
+        '<td>'+fmtMem(vm.maxMemory)+'</td>' +
+        '<td>'+(vm.maxCores||'—')+'</td>' +
+        '<td>'+esc(ip)+'</td>' +
+        '<td>'+esc(vm.cloudName||'—')+'</td>' +
+        '<td>'+esc(dsLabel(vm)||'—')+'</td>' +
+        '<td>'+folderLabel+'</td>' +
+        '<td><div style="display:flex;gap:3px;flex-wrap:wrap">' +
+        (!window.vmfReadOnly ? '<button class="vmf-act vmf-move-btn" data-id="'+id+'">Move</button>' : '') +
+        '<a class="vmf-act vmf-act-console" href="/terminal/server/'+id+'?consoleMode=hypervisor" target="_blank" title="Open console">&#9654;</a>' +
+        (isOn ? '<button class="vmf-act vmf-pw-btn vmf-stop-btn" data-id="'+id+'" data-action="stop" title="Stop VM">&#9632; Stop</button>' : '<button class="vmf-act vmf-pw-btn vmf-start-btn" data-id="'+id+'" data-action="start" title="Start VM">&#9654; Start</button>') +
+        (!window.vmfReadOnly && fp!==ROOT ? '<button class="vmf-act vmf-act-x vmf-rm-btn" data-id="'+id+'" title="Remove from folder">&#10006;</button>' : '') +
+        '</div></td></tr>' + diskDetailRow(vm);
+    });
+    html += '</tbody></table>';
+    el.innerHTML = html;
+
+    bindVlist(el);
+    // Status reflects the rows actually listed; when host/cloud scoping or a folder
+    // narrows the set, name the total too so the footer can't contradict the table.
+    var total = allVms.length;
+    setStatus(vms.length+' VM'+(vms.length!==1?'s':'')+(vms.length!==total?' of '+total:'')+(searchQ?' (filtered)':''));
   }
 
   // ── Public ─────────────────────────────────────────────────────────
@@ -366,12 +641,20 @@
     selectedIds.clear(); updateMvBtn();
     try {
       await fetchAll();
-      // Auto-detect cloud from context set by HBS template (DOM-read synchronously)
+      // Auto-detect cloud from context set by HBS template (DOM-read synchronously).
+      // Adopt it only when it names a cloud the loaded VMs actually report, so a bad
+      // DOM scrape cannot latch a filter that empties every view.
       if (cloudFilter === '__all__' && window.vmfContextCloud) {
-        cloudFilter = window.vmfContextCloud;
+        if (allVms.some(function(vm){ return (vm.cloudName||'') === window.vmfContextCloud; })) {
+          cloudFilter = window.vmfContextCloud;
+        } else {
+          try { console.warn('vmFolders: context cloud "'+window.vmfContextCloud+'" matches no VM; staying on All'); } catch(e) {}
+          window.vmfContextCloud = null;
+        }
       }
-      renderCloudBar(); renderTree(); renderVms();
-      setStatus(allVms.length+' VMs loaded');
+      renderCloudBar(); renderTree(); renderDatastores(); renderVms();
+      // renderVms() has already set the status to the rows it listed — do not overwrite
+      // it with the unscoped total (that is what showed "21 VMs loaded" against 9 rows).
     } catch(e) {
       if(vl) vl.innerHTML='<div class="vmf-empty"><div class="vmf-empty-icon">&#9888;</div><div style="color:#c00">Error: '+esc(e.message)+'</div></div>';
       setStatus('Error');
@@ -379,9 +662,16 @@
   };
 
   window.vmfSelectFolder = function(key) {
-    activeFolder=key; selectedIds.clear(); updateMvBtn(); renderTree(); renderVms();
+    resetSelection(key, null); updateMvBtn(); renderTree(); renderDatastores(); renderVms();
     var bc=document.getElementById('vmf-bc');
     if(bc) bc.innerHTML='&#128193; <b>'+esc(key==='__all__'?'All VMs':key===ROOT?'Unorganized':key)+'</b>';
+  };
+
+  // Read-only datastore view: filters the table, never writes assignments.
+  window.vmfSelectDatastore = function(key) {
+    resetSelection('__all__', key); updateMvBtn(); renderTree(); renderDatastores(); renderVms();
+    var bc=document.getElementById('vmf-bc');
+    if(bc) bc.innerHTML='&#128451; Datastore: <b>'+esc(key===NO_DS?'No datastore':key)+'</b>';
   };
 
   window.vmfSort = function(col) { if(sortCol===col) sortAsc=!sortAsc; else{sortCol=col;sortAsc=true;} renderVms(); };
@@ -425,7 +715,7 @@
         if(!path.startsWith('/')) path='/'+path;
         var desc=(document.getElementById('vmf-nfd')||{}).value||'';
         vmfCloseModal();
-        var d=await get('/saveFolder?path='+encodeURIComponent(path)+'&desc='+encodeURIComponent(desc));
+        var d=await post('/saveFolder', {path: path, desc: desc});
         if(d.success){
           vmfToast('Folder '+path+' created');
           await fetchAll(); renderTree(); vmfSelectFolder(path);
@@ -448,7 +738,7 @@
         var np=el.value.trim(); if(!np||np===path) return vmfCloseModal();
         if(!np.startsWith('/')) np='/'+np;
         vmfCloseModal();
-        var d=await get('/renFolder?oldPath='+encodeURIComponent(path)+'&newPath='+encodeURIComponent(np));
+        var d=await post('/renFolder', {oldPath: path, newPath: np});
         if(d.success){ vmfToast('Renamed to '+np); await fetchAll(); renderTree(); vmfSelectFolder(np); }
         else vmfToast('Failed: '+d.error,true);
       }}
@@ -460,7 +750,7 @@
     var c=countIn(path);
     var msg='Delete "'+path+'"?'+(c>0?' '+c+' VM(s) will become Unorganized.':'');
     openConfirm('Delete Folder', msg, async function() {
-      var d=await get('/delFolder?path='+encodeURIComponent(path));
+      var d=await post('/delFolder', {path: path});
       if(d.success){ vmfToast('Folder deleted'); await fetchAll(); renderTree(); vmfSelectFolder('__all__'); }
       else vmfToast('Failed: '+d.error,true);
     });
@@ -470,7 +760,7 @@
     var labels={start:'Starting',stop:'Stopping',restart:'Restarting'};
     setStatus(labels[action]||'Working'+'...');
     try {
-      var d=await get('/power?vmId='+id+'&action='+action);
+      var d=await post('/power', {vmId: id, action: action});
       vmfToast(d.success ? (action.charAt(0).toUpperCase()+action.slice(1)+' VM '+id) : 'Power failed: '+d.error, !d.success);
       if(d.success) setTimeout(vmfReload, 3000);
     } catch(e){ vmfToast('Power error: '+e.message,true); }
@@ -484,14 +774,14 @@
     for(var i=0;i<ids.length;i++){
       try {
         var d = path===ROOT
-          ? await get('/unassign?vmId='+ids[i])
-          : await get('/assign?vmId='+ids[i]+'&path='+encodeURIComponent(path));
+          ? await post('/unassign', {vmId: ids[i]})
+          : await post('/assign', {vmId: ids[i], path: path});
         if(d.success) ok++; else fail++;
       } catch(e){fail++;}
     }
     selectedIds.clear(); updateMvBtn();
     vmfToast(fail>0?ok+' moved, '+fail+' failed':'Moved '+ok+' VM'+(ok!==1?'s':'')+' to '+(path===ROOT?'Unorganized':path),fail>0);
-    await fetchAll(); renderTree(); renderVms();
+    await fetchAll(); renderTree(); renderDatastores(); renderVms();
   }
 
   function fg(label,input,hint) {
@@ -616,8 +906,7 @@
       var r=await fetch('/plugin/vmFolders/serverActions?vmId='+id);
       if(r.ok){var d=await r.json();if(d.actions&&d.actions.length){actions.push({divider:true});d.actions.forEach(function(a){if(['start','stop'].includes((a.code||'').toLowerCase()))return;actions.push({label:'&#9881; '+a.name,fn:(function(ac,an,au){return function(){
               if(au){window.open(au,'_blank');dd.remove();return;}
-              fetch('/plugin/vmFolders/executeAction?vmId='+id+'&action='+encodeURIComponent(ac),{method:'POST'})
-                .then(function(res){return res.json();})
+              post('/executeAction', {vmId: id, action: ac})
                 .then(function(res){vmfToast(res.success?an+' sent':'Failed: '+(res.error||''),!res.success);})
                 .catch(function(e){vmfToast('Error: '+e.message,true);});
               dd.remove();};})(a.code,a.name,a.url||null)});});}}
@@ -669,8 +958,8 @@
         folders['/'+cloud]=true; folders['/'+cloud+'/'+host]=true;
         assignments[vm.id]='/'+cloud+'/'+host;
       });
-      for(var fp of Object.keys(folders).sort()) await get('/saveFolder?path='+encodeURIComponent(fp));
-      for(var vid of Object.keys(assignments)) await get('/assign?vmId='+vid+'&path='+encodeURIComponent(assignments[vid]));
+      for(var fp of Object.keys(folders).sort()) await post('/saveFolder', {path: fp});
+      for(var vid of Object.keys(assignments)) await post('/assign', {vmId: vid, path: assignments[vid]});
       await fetchAll();renderTree();vmfSelectFolder('__all__');
       vmfToast('Auto-organized '+allVms.length+' VMs');
     });
@@ -680,8 +969,7 @@
   window.vmfResyncHosts = async function() {
     openConfirm('Re-sync Host Assignments','Update VMs in Cloud/Host folders to reflect current host locations.',async function(){
       setStatus('Re-syncing...');
-      var r=await fetch('/plugin/vmFolders/resync');
-      var d=await r.json();
+      var d=await post('/resync', {});
       vmfToast(d.success?(d.moved>0?'Re-synced '+d.moved+' VM(s)':'All VMs already current'):'Re-sync failed: '+d.error,!d.success);
       if(d.success&&d.moved>0){await fetchAll();renderTree();renderVms();}
     });

@@ -13,6 +13,9 @@ import com.morpheusdata.model.Permission
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
 import groovy.util.logging.Slf4j
+import java.io.FileOutputStream
+import java.io.OutputStreamWriter
+import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Paths
 import java.nio.file.StandardCopyOption
@@ -26,7 +29,7 @@ class VmFoldersController implements PluginController {
 
     static final String DATA_DIR  = '/var/opt/morpheus/morpheus-ui/plugins'
     static final String DB_FILE   = "${DATA_DIR}/vm-folders.json"
-    static final String VERSION   = '1.1.0'
+    static final String VERSION   = '1.3.6'
     static final String BAK_FILE  = "${DATA_DIR}/vm-folders.json.bak"
 
     VmFoldersController(Plugin plugin, MorpheusContext morpheusContext) {
@@ -63,8 +66,84 @@ class VmFoldersController implements PluginController {
         ]
     }
 
+    // ── Request guards ────────────────────────────────────────────────
+    // Route.method in plugin-api 1.3.0 is the controller method name, not an
+    // HTTP verb, so verb enforcement has to happen here.
+    //
+    // CSRF: the plugin API exposes no session token accessor, so mutations are
+    // protected by (a) POST only, (b) a required custom header that browsers
+    // will not attach cross-origin without a CORS preflight, and (c) an
+    // Origin/Referer host check when either header is present.
+    static final String REQ_HEADER = 'X-VMF-Request'
+
+    /** Returns null if the request may mutate state, otherwise a JsonResponse rejecting it. */
+    private JsonResponse requireMutation(ViewModel<Map> model) {
+        // On Morpheus 9.0.2 model.request is not an instance of javax.servlet.http.HttpServletRequest
+        // under the plugin classloader (1.1.3 returned 400 here on every POST), so access it
+        // dynamically: Groovy dispatches getMethod()/getHeader() on whatever wrapper core hands us.
+        def req = model?.request
+        if (req == null) return reject(model, 400, 'invalid request')
+        String verb = ''
+        try { verb = (req.respondsTo('getMethod') ? req.getMethod() : req.method)?.toString()?.toUpperCase() ?: '' }
+        catch(ex) { log.warn("VmFolders: cannot read request method (${req.getClass().name}): ${ex.message}"); return reject(model, 400, 'invalid request') }
+        if (verb != 'POST') return reject(model, 405, 'POST required')
+        if (!header(req, REQ_HEADER)) return reject(model, 403, 'missing request header')
+        def origin = header(req, 'Origin') ?: header(req, 'Referer')
+        if (origin) {
+            def originHost = ''
+            try { originHost = new URI(origin).host ?: '' } catch(ex) { originHost = '' }
+            def serverName = ''
+            try { serverName = req.respondsTo('getServerName') ? (req.getServerName() ?: '') : '' } catch(ex) {}
+            def reqHost = (header(req, 'X-Forwarded-Host') ?: header(req, 'Host') ?: serverName ?: '')
+                .split(',')[0].trim().split(':')[0]
+            if (!originHost || !originHost.equalsIgnoreCase(reqHost)) return reject(model, 403, 'cross-origin request rejected')
+        }
+        if (!model?.user?.account) return reject(model, 401, 'no authenticated user')
+        return null
+    }
+
+    /** Header lookup that works on any servlet-request-like object; null if unavailable. */
+    private static String header(def req, String name) {
+        try { return req.respondsTo('getHeader') ? req.getHeader(name)?.toString() : null }
+        catch(ex) { return null }
+    }
+
+    private JsonResponse reject(ViewModel<Map> model, int status, String msg) {
+        if (status == 401) log.error("VmFolders: ViewModel.user/account is null on this request — tenant scoping cannot be enforced; refusing")
+        def r = JsonResponse.of([success: false, error: msg])
+        r.status = status
+        return r
+    }
+
+    // ── Tenant scoping ────────────────────────────────────────────────
+    private DataQuery userQuery(ViewModel<Map> model) {
+        // DataQuery(UserIdentity) sets account = user.account. Scoping is not
+        // guaranteed by every service impl, so callers also filter explicitly.
+        return new DataQuery(model.user)
+    }
+
+    private boolean canAccess(ViewModel<Map> model, def server) {
+        def acct = model?.user?.account
+        if (!acct || !server) return false
+        if (acct.masterAccount) return true
+        return server.account?.id == acct.id
+    }
+
+    /** Loads a server and verifies the caller's tenant may act on it; null if not. */
+    private def scopedServer(ViewModel<Map> model, Long id) {
+        if (!id) return null
+        def s = morpheusContext.services.computeServer.get(id)
+        return canAccess(model, s) ? s : null
+    }
+
     // ── DB helpers ────────────────────────────────────────────────────
-    private synchronized Map readDb() {
+    private final Object dbLock = new Object()
+
+    private Map readDb() {
+        synchronized (dbLock) { return readDbUnlocked() }
+    }
+
+    private Map readDbUnlocked() {
         try {
             def f = new File(DB_FILE)
             if (f.exists()) {
@@ -78,18 +157,35 @@ class VmFoldersController implements PluginController {
         return [folders: [], assignments: [:], history: [], version: 1]
     }
 
-    private synchronized void writeDb(Map data) {
+    /**
+     * Atomic read-modify-write. The closure receives the current DB map and
+     * returns true if it changed anything (triggers a write) or false to skip.
+     */
+    private Map mutateDb(Closure<Boolean> mutation) {
+        synchronized (dbLock) {
+            def db = readDbUnlocked()
+            def changed = mutation.call(db)
+            if (changed) writeDbUnlocked(db)
+            return db
+        }
+    }
+
+    private void writeDbUnlocked(Map data) {
+        def f    = new File(DB_FILE)
+        def tmp  = new File(DB_FILE + '.tmp')
+        def bak  = new File(BAK_FILE)
+        if (f.exists()) Files.copy(f.toPath(), bak.toPath(), StandardCopyOption.REPLACE_EXISTING)
+        data.lastModified = new Date().toString()
+        data.version = (data.version ?: 0) + 1
+        def json = JsonOutput.prettyPrint(JsonOutput.toJson(data))
+        def fos = new FileOutputStream(tmp)
         try {
-            def f    = new File(DB_FILE)
-            def tmp  = new File(DB_FILE + '.tmp')
-            def bak  = new File(BAK_FILE)
-            // Rotate backup before write
-            if (f.exists()) Files.copy(f.toPath(), bak.toPath(), StandardCopyOption.REPLACE_EXISTING)
-            data.lastModified = new Date().toString()
-            data.version = (data.version ?: 0) + 1
-            tmp.text = JsonOutput.prettyPrint(JsonOutput.toJson(data))
-            Files.move(tmp.toPath(), f.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
-        } catch(e) { log.error("writeDb: ${e.message}") }
+            def w = new OutputStreamWriter(fos, StandardCharsets.UTF_8)
+            w.write(json)
+            w.flush()
+            fos.getFD().sync()      // durable before the rename
+        } finally { fos.close() }
+        Files.move(tmp.toPath(), f.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
     }
 
     private void addHistory(Map db, String action, Map details) {
@@ -107,15 +203,68 @@ class VmFoldersController implements PluginController {
         return HTMLResponse.success(html)
     }
 
+    /**
+     * True for a VM Morpheus inventoried from the hypervisor rather than provisioned:
+     * `serverType == 'unmanaged'` or `discovered == true` (verified on 9.0.2 against a
+     * host's Discovered VMs tab, 2026-09-21).
+     *
+     * NOT `ComputeServer.managed` — that is the agent flag. Keying off it in 1.3.0-1.3.2
+     * mislabelled VMs and removed power controls from running instances.
+     *
+     * This drives a label only. Power and actions stay available for every VM: the
+     * platform decides what it will accept, and its own error beats a hidden button.
+     */
+    private static boolean isUnmanaged(def s) {
+        try {
+            if (s.serverType?.toString()?.equalsIgnoreCase('unmanaged')) return true
+            return s.discovered == true
+        } catch(ex) { return false }
+    }
+
+    // ── Disks ─────────────────────────────────────────────────────────
+    // computeServer.list(DataQuery) hydrates volumes on 9.0.2 (verified 2026-09-20),
+    // so no per-server fetch is needed. Datastore may be null on VME volumes —
+    // that is a real "no datastore" bucket, not an error. Sizes are bytes.
+    private List<Map> diskList(def s) {
+        def vols = []
+        try { vols = (s.volumes ?: []).toList() } catch(ex) { return [] }
+        vols = vols.sort { a, b ->
+            def ra = a.rootVolume ? 0 : 1, rb = b.rootVolume ? 0 : 1
+            ra <=> rb ?: ((a.displayOrder ?: 0) <=> (b.displayOrder ?: 0)) ?: ((a.id ?: 0L) <=> (b.id ?: 0L))
+        }
+        vols.collect { v ->
+            def dsName = null
+            try { def d = v.datastore; dsName = (d instanceof String ? d : d?.name)?.toString() ?: null } catch(ex) {}
+            // Volume type explains why a disk has no datastore: types with
+            // hasDatastore=false (CD/DVD, mounted ISO) never carry one.
+            def typeName = null
+            try {
+                def t = v.type
+                typeName = (t instanceof String ? t : (t?.displayName ?: t?.code ?: t?.volumeType))?.toString() ?: null
+            } catch(ex) {}
+            if (!typeName) { try { typeName = (v.volumeType ?: v.diskType)?.toString() ?: null } catch(ex) {} }
+            [
+                name     : (v.deviceDisplayName ?: v.name ?: '')?.toString(),
+                datastore: dsName,
+                type     : typeName,
+                removable: v.removable ? true : false,
+                total    : (v.maxStorage ?: 0L) as Long,
+                used     : (v.usedStorage ?: 0L) as Long,
+                root     : v.rootVolume ? true : false
+            ]
+        }
+    }
+
     // ── API: VM list ──────────────────────────────────────────────────
     def vms(ViewModel<Map> model) {
         try {
+            if (!model?.user?.account) return reject(model, 401, 'no authenticated user')
             def db = readDb()
             def assignments = db.assignments as Map ?: [:]
 
             def servers = morpheusContext.services.computeServer.list(
-                new DataQuery().withFilter(new DataFilter('vmHypervisor', false))
-            ).toList()
+                userQuery(model).withFilter(new DataFilter('vmHypervisor', false))
+            ).toList().findAll { canAccess(model, it) }
 
             def result = servers.collect { s ->
                 def ps = s.powerState
@@ -127,6 +276,7 @@ class VmFoldersController implements PluginController {
                 } catch(ex) {}
                 def cloudName = ''
                 try { cloudName = (s.cloud instanceof String ? s.cloud : s.cloud?.name) ?: '' } catch(ex) {}
+                def disks = diskList(s)
 
                 [
                     id         : s.id,
@@ -142,10 +292,13 @@ class VmFoldersController implements PluginController {
                     maxMemory  : s.maxMemory ?: 0,
                     maxCores   : s.maxCores ?: 0,
                     cloudName  : cloudName,
-                    folderPath : assignments[s.id?.toString()] ?: '/'
+                    folderPath : assignments[s.id?.toString()] ?: '/',
+                    disks      : disks,
+                    datastores : disks*.datastore.findAll { it }.unique().sort(),
+                    unmanaged  : isUnmanaged(s)
                 ]
             }
-            return JsonResponse.of([servers: result, meta: [total: result.size()]])
+            return JsonResponse.of([servers: result, meta: [total: result.size(), unmanaged: result.count { it.unmanaged }]])
         } catch(e) {
             log.error("vms error: ${e.message}", e)
             return JsonResponse.of([error: e.message, servers: [], meta: [total: 0]])
@@ -160,17 +313,19 @@ class VmFoldersController implements PluginController {
     // ── API: save folder ──────────────────────────────────────────────
     def saveFolder(ViewModel<Map> model) {
         try {
+            def denied = requireMutation(model); if (denied) return denied
             def path = model?.request?.getParameter('path') as String
             def desc = model?.request?.getParameter('desc') as String ?: ''
             if (!path) return JsonResponse.of([success: false, error: 'path required'])
             if (!path.startsWith('/')) path = '/' + path
-            def db = readDb()
-            def folders = db.folders as List ?: []
-            if (!folders.find { it.path == path }) {
-                folders << [path: path, desc: desc, created: new Date().toString()]
+            def fpath = path
+            mutateDb { Map db ->
+                def folders = db.folders as List ?: []
+                if (folders.find { it.path == fpath }) return false
+                folders << [path: fpath, desc: desc, created: new Date().toString()]
                 db.folders = folders
-                addHistory(db, 'create_folder', [path: path])
-                writeDb(db)
+                addHistory(db, 'create_folder', [path: fpath])
+                return true
             }
             return JsonResponse.of([success: true, path: path])
         } catch(e) {
@@ -182,16 +337,18 @@ class VmFoldersController implements PluginController {
     // ── API: delete folder ────────────────────────────────────────────
     def delFolder(ViewModel<Map> model) {
         try {
+            def denied = requireMutation(model); if (denied) return denied
             def path = model?.request?.getParameter('path') as String
             if (!path) return JsonResponse.of([success: false, error: 'path required'])
-            def db = readDb()
-            // Remove folder and all sub-folder assignments
-            db.folders = (db.folders as List ?: []).findAll { it.path != path && !it.path.startsWith(path + '/') }
-            def asgn = db.assignments as Map ?: [:]
-            asgn.entrySet().removeIf { e -> e.value == path || e.value.startsWith(path + '/') }
-            db.assignments = asgn
-            addHistory(db, 'delete_folder', [path: path])
-            writeDb(db)
+            mutateDb { Map db ->
+                // Remove folder and all sub-folder assignments
+                db.folders = (db.folders as List ?: []).findAll { it.path != path && !it.path.startsWith(path + '/') }
+                def asgn = db.assignments as Map ?: [:]
+                asgn.entrySet().removeIf { e -> e.value == path || e.value.startsWith(path + '/') }
+                db.assignments = asgn
+                addHistory(db, 'delete_folder', [path: path])
+                return true
+            }
             return JsonResponse.of([success: true])
         } catch(e) {
             log.error("delFolder: ${e.message}", e)
@@ -202,29 +359,31 @@ class VmFoldersController implements PluginController {
     // ── API: rename folder ────────────────────────────────────────────
     def renFolder(ViewModel<Map> model) {
         try {
+            def denied = requireMutation(model); if (denied) return denied
             def oldPath = model?.request?.getParameter('oldPath') as String
             def newPath = model?.request?.getParameter('newPath') as String
             if (!oldPath || !newPath) return JsonResponse.of([success: false, error: 'oldPath and newPath required'])
             if (!newPath.startsWith('/')) newPath = '/' + newPath
-            def db = readDb()
+            def np = newPath
+            mutateDb { Map db ->
+                // Update folder definitions
+                def folders = db.folders as List ?: []
+                folders.each { f ->
+                    if (f.path == oldPath) f.path = np
+                    else if (f.path.startsWith(oldPath + '/')) f.path = np + f.path.substring(oldPath.length())
+                }
+                db.folders = folders
 
-            // Update folder definitions
-            def folders = db.folders as List ?: []
-            folders.each { f ->
-                if (f.path == oldPath) f.path = newPath
-                else if (f.path.startsWith(oldPath + '/')) f.path = newPath + f.path.substring(oldPath.length())
+                // Update assignments
+                def asgn = db.assignments as Map ?: [:]
+                asgn.each { k, v ->
+                    if (v == oldPath) asgn[k] = np
+                    else if (v.startsWith(oldPath + '/')) asgn[k] = np + v.substring(oldPath.length())
+                }
+                db.assignments = asgn
+                addHistory(db, 'rename_folder', [from: oldPath, to: np])
+                return true
             }
-            db.folders = folders
-
-            // Update assignments
-            def asgn = db.assignments as Map ?: [:]
-            asgn.each { k, v ->
-                if (v == oldPath) asgn[k] = newPath
-                else if (v.startsWith(oldPath + '/')) asgn[k] = newPath + v.substring(oldPath.length())
-            }
-            db.assignments = asgn
-            addHistory(db, 'rename_folder', [from: oldPath, to: newPath])
-            writeDb(db)
             return JsonResponse.of([success: true, newPath: newPath])
         } catch(e) {
             log.error("renFolder: ${e.message}", e)
@@ -235,22 +394,27 @@ class VmFoldersController implements PluginController {
     // ── API: assign VM to folder ──────────────────────────────────────
     def assign(ViewModel<Map> model) {
         try {
+            def denied = requireMutation(model); if (denied) return denied
             def vmId = model?.request?.getParameter('vmId') as String
             def path = model?.request?.getParameter('path') as String
             if (!vmId || !path) return JsonResponse.of([success: false, error: 'vmId and path required'])
+            if (!vmId.isLong()) return JsonResponse.of([success: false, error: 'invalid vmId'])
+            if (!scopedServer(model, vmId as Long)) return reject(model, 404, 'server not found')
             if (!path.startsWith('/')) path = '/' + path
-            def db = readDb()
-            def asgn = db.assignments as Map ?: [:]
-            asgn[vmId] = path
-            db.assignments = asgn
-            // Auto-create folder if it doesn't exist
-            def folders = db.folders as List ?: []
-            if (!folders.find { it.path == path }) {
-                folders << [path: path, desc: '', created: new Date().toString()]
-                db.folders = folders
+            def fpath = path
+            mutateDb { Map db ->
+                def asgn = db.assignments as Map ?: [:]
+                asgn[vmId] = fpath
+                db.assignments = asgn
+                // Auto-create folder if it doesn't exist
+                def folders = db.folders as List ?: []
+                if (!folders.find { it.path == fpath }) {
+                    folders << [path: fpath, desc: '', created: new Date().toString()]
+                    db.folders = folders
+                }
+                addHistory(db, 'assign', [vmId: vmId, path: fpath])
+                return true
             }
-            addHistory(db, 'assign', [vmId: vmId, path: path])
-            writeDb(db)
             return JsonResponse.of([success: true])
         } catch(e) {
             log.error("assign: ${e.message}", e)
@@ -261,14 +425,22 @@ class VmFoldersController implements PluginController {
     // ── API: remove VM from folder ────────────────────────────────────
     def unassign(ViewModel<Map> model) {
         try {
+            def denied = requireMutation(model); if (denied) return denied
             def vmId = model?.request?.getParameter('vmId') as String
             if (!vmId) return JsonResponse.of([success: false, error: 'vmId required'])
-            def db = readDb()
-            def asgn = db.assignments as Map ?: [:]
-            asgn.remove(vmId)
-            db.assignments = asgn
-            addHistory(db, 'unassign', [vmId: vmId])
-            writeDb(db)
+            if (!vmId.isLong()) return JsonResponse.of([success: false, error: 'invalid vmId'])
+            // Allow clearing stale assignments for VMs no longer in Morpheus,
+            // but never touch a VM that exists and belongs to another tenant.
+            def existing = morpheusContext.services.computeServer.get(vmId as Long)
+            if (existing && !canAccess(model, existing)) return reject(model, 404, 'server not found')
+            mutateDb { Map db ->
+                def asgn = db.assignments as Map ?: [:]
+                if (!asgn.containsKey(vmId)) return false
+                asgn.remove(vmId)
+                db.assignments = asgn
+                addHistory(db, 'unassign', [vmId: vmId])
+                return true
+            }
             return JsonResponse.of([success: true])
         } catch(e) {
             log.error("unassign: ${e.message}", e)
@@ -279,10 +451,11 @@ class VmFoldersController implements PluginController {
     // ── API: backup ───────────────────────────────────────────────────
     def backup(ViewModel<Map> model) {
         try {
+            def denied = requireMutation(model); if (denied) return denied
             def f = new File(DB_FILE)
             def bak = new File(BAK_FILE)
             if (!f.exists()) return JsonResponse.of([success: false, error: 'No database to backup'])
-            Files.copy(f.toPath(), bak.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            synchronized (dbLock) { Files.copy(f.toPath(), bak.toPath(), StandardCopyOption.REPLACE_EXISTING) }
             return JsonResponse.of([success: true, message: "Backed up to ${BAK_FILE}", size: bak.length()])
         } catch(e) {
             return JsonResponse.of([success: false, error: e.message])
@@ -292,9 +465,15 @@ class VmFoldersController implements PluginController {
     // ── API: restore from backup ──────────────────────────────────────
     def restore(ViewModel<Map> model) {
         try {
+            def denied = requireMutation(model); if (denied) return denied
             def bak = new File(BAK_FILE)
             if (!bak.exists()) return JsonResponse.of([success: false, error: 'No backup file found'])
-            Files.copy(bak.toPath(), Paths.get(DB_FILE), StandardCopyOption.REPLACE_EXISTING)
+            synchronized (dbLock) {
+                // Parse first so a corrupt backup cannot replace a good DB.
+                def parsed = new JsonSlurper().parse(bak)
+                if (!(parsed instanceof Map)) return JsonResponse.of([success: false, error: 'Backup is not a valid database'])
+                Files.copy(bak.toPath(), Paths.get(DB_FILE), StandardCopyOption.REPLACE_EXISTING)
+            }
             return JsonResponse.of([success: true, message: 'Restored from backup'])
         } catch(e) {
             return JsonResponse.of([success: false, error: e.message])
@@ -355,9 +534,11 @@ class VmFoldersController implements PluginController {
     // ── API: power control ────────────────────────────────────────────
     def power(ViewModel<Map> model) {
         try {
+            def denied = requireMutation(model); if (denied) return denied
             def vmId = model?.request?.getParameter('vmId') as Long
             def action = model?.request?.getParameter('action') as String
             if (!vmId || !action) return JsonResponse.of([success: false, error: 'vmId and action required'])
+            if (!scopedServer(model, vmId)) return reject(model, 404, 'server not found')
             def result = false
             switch(action) {
                 case 'start':   result = morpheusContext.services.computeServer.startServer(vmId); break
@@ -413,6 +594,8 @@ class VmFoldersController implements PluginController {
     body.dark .vmf-fg input:disabled { background: var(--hpe-white); color: var(--hpe-text); }
     body.dark table.vmft tbody tr:hover { background: var(--hpe-row-hover); }
     body.dark table.vmft tbody tr.sel  { background: var(--hpe-selected); }
+    body.dark #vmf-ds-head, body.dark tr.vmf-disk-row, body.dark tr.vmf-disk-row:hover { background: var(--hpe-bg); }
+    body.dark .vmf-badge-un { background:#3A2E1A; color:#E0B870; border-color:#5A4828; }
     body.dark #vmf-search { background: var(--hpe-white); color: var(--hpe-text); border-color: var(--hpe-border); }
     body.dark .vmf-act   { background: var(--hpe-white); color: var(--hpe-text); border-color: var(--hpe-border); }
     body.dark .vmf-act:hover { border-color: var(--hpe-green); color: var(--hpe-green); }
@@ -461,6 +644,17 @@ class VmFoldersController implements PluginController {
     .vmf-fi-btn:hover { color:var(--hpe-text); background:#eee; }
     .vmf-fi-btn.del:hover { color:#c00; background:#fff0f0; }
     .vmf-divider { height:1px; background:var(--hpe-border); margin:3px 0; opacity:.5; }
+    #vmf-ds-head { padding:8px 14px; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.07em; color:var(--hpe-muted); background:var(--hpe-bg); border-top:1px solid var(--hpe-border); border-bottom:1px solid var(--hpe-border); flex-shrink:0; }
+    #vmf-dslist { max-height:38%; overflow-y:auto; padding:4px 0; flex-shrink:0; }
+    .vmf-chev { display:inline-block; width:14px; cursor:pointer; color:var(--hpe-muted); font-size:10px; user-select:none; margin-right:2px; transition:transform .15s; }
+    .vmf-chev.open { transform:rotate(90deg); }
+    .vmf-chev-none { display:inline-block; width:14px; margin-right:2px; }
+    tr.vmf-disk-row { background:var(--hpe-bg); }
+    tr.vmf-disk-row:hover { background:var(--hpe-bg); }
+    tr.vmf-disk-row > td { padding:4px 12px 10px 48px; }
+    table.vmft-sub { border-collapse:collapse; font-size:11px; min-width:420px; }
+    table.vmft-sub th { text-align:left; font-weight:600; color:var(--hpe-muted); text-transform:uppercase; letter-spacing:.04em; font-size:10px; padding:3px 10px 3px 0; border-bottom:1px solid var(--hpe-border); }
+    table.vmft-sub td { padding:3px 10px 3px 0; color:var(--hpe-text); }
     #vmf-content { flex:1; display:flex; flex-direction:column; overflow:hidden; }
     #vmf-toolbar { display:flex; align-items:center; gap:8px; padding:8px 14px; background:#fff; border-bottom:1px solid var(--hpe-border); flex-shrink:0; }
     #vmf-search { flex:1; max-width:280px; padding:5px 10px; border:1px solid var(--hpe-border); border-radius:4px; font-size:13px; }
@@ -480,6 +674,7 @@ class VmFoldersController implements PluginController {
     .vmft-name a { color:var(--hpe-green-dark); text-decoration:none; font-weight:500; }
     .vmft-name a:hover { text-decoration:underline; }
     .vmf-dot { display:inline-block; width:7px; height:7px; border-radius:50%; margin-right:5px; vertical-align:middle; }
+    .vmf-badge-un { display:inline-block; background:#fff3e0; color:#8a5300; border:1px solid #f0c890; border-radius:3px; padding:0 5px; font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:.03em; vertical-align:middle; }
     .vmf-tag { display:inline-block; background:#e6f5f1; color:var(--hpe-green-dark); border-radius:3px; padding:1px 7px; font-size:11px; font-weight:500; border:1px solid #b3e0d5; }
     .vmf-act { padding:3px 8px; font-size:11px; border:1px solid var(--hpe-border); border-radius:3px; background:#fff; cursor:pointer; color:var(--hpe-text); text-decoration:none; display:inline-flex; align-items:center; }
     .vmf-act:hover { border-color:var(--hpe-green); color:var(--hpe-green-dark); }
@@ -536,6 +731,8 @@ class VmFoldersController implements PluginController {
       <div id="vmf-cloud-bar" style="display:flex;flex-wrap:nowrap;gap:4px;padding:5px 10px;background:var(--hpe-bg);border-bottom:1px solid var(--hpe-border);flex-shrink:0;overflow-x:auto;align-items:center;"></div>
       <div id="vmf-tree-head">Folders</div>
       <div id="vmf-flist"><div class="vmf-spin"><div class="vmf-spinner"></div>Loading...</div></div>
+      <div id="vmf-ds-head" style="display:none">Datastores</div>
+      <div id="vmf-dslist" style="display:none"></div>
     </div>
     <div id="vmf-content">
       <div id="vmf-toolbar">
@@ -578,14 +775,17 @@ class VmFoldersController implements PluginController {
       document.getElementById('vmf-close-modal').addEventListener('click', function() { vmfCloseModal(); });
       document.getElementById('vmf-modal').addEventListener('click', function(e) { if(e.target===this) vmfCloseModal(); });
       document.addEventListener('keydown', function(e) { if(e.key==='Escape') vmfCloseModal(); });
+      // backup and restore are mutations: they must go through vmfPost (POST +
+      // X-VMF-Request + core's CSRF token). A plain GET fetch here returned
+      // 405 "POST required" from requireMutation() — both buttons were dead.
       document.getElementById('vmf-backup-btn').addEventListener('click', async function() {
-        var d = await fetch(window.vmfApiBase+'/backup',{credentials:'same-origin'}).then(r=>r.json());
-        vmfToast(d.success ? 'Backup created' : 'Backup failed: '+d.error, !d.success);
+        var d = await window.vmfPost('/backup', {});
+        vmfToast(d.success ? 'Backup created' : 'Backup failed: '+(d.error||'unknown'), !d.success);
       });
       document.getElementById('vmf-restore-btn').addEventListener('click', function() {
         openConfirm('Restore from backup?', 'This will overwrite current data with the last backup.', async function() {
-          var d = await fetch(window.vmfApiBase+'/restore',{credentials:'same-origin'}).then(r=>r.json());
-          vmfToast(d.success ? 'Restored from backup' : 'Restore failed: '+d.error, !d.success);
+          var d = await window.vmfPost('/restore', {});
+          vmfToast(d.success ? 'Restored from backup' : 'Restore failed: '+(d.error||'unknown'), !d.success);
           if(d.success) vmfReload();
         });
       });
@@ -601,8 +801,8 @@ class VmFoldersController implements PluginController {
         try {
             def vmId = model?.request?.getParameter('vmId') as Long
             if (!vmId) return JsonResponse.of([success:false, error:'vmId required'])
-            def server = morpheusContext.services.computeServer.get(vmId)
-            if (!server) return JsonResponse.of([success:false, error:'Server not found'])
+            def server = scopedServer(model, vmId)
+            if (!server) return reject(model, 404, 'Server not found')
             // Build standard action list based on server type and state
             def ps = server.powerState?.toString()?.toLowerCase() ?: 'unknown'
             def isOn = ps.matches('.*on.*|.*running.*')
@@ -620,9 +820,11 @@ class VmFoldersController implements PluginController {
     // ── API: execute server action ────────────────────────────────────
     def executeAction(ViewModel<Map> model) {
         try {
+            def denied = requireMutation(model); if (denied) return denied
             def vmId   = model?.request?.getParameter('vmId') as Long
             def action = model?.request?.getParameter('action') ?: ''
             if (!vmId || !action) return JsonResponse.of([success:false, error:'vmId and action required'])
+            if (!scopedServer(model, vmId)) return reject(model, 404, 'server not found')
             switch(action) {
                 case 'restart':
                     def result = morpheusContext.services.computeServer.restartServer(vmId)
@@ -639,31 +841,29 @@ class VmFoldersController implements PluginController {
     // ── API: resync host assignments for auto-migrated VMs ────────────
     def resync(ViewModel<Map> model) {
         try {
-            def db = readDb()
-            def assignments = db.assignments as Map ?: [:]
+            def denied = requireMutation(model); if (denied) return denied
+            // Compute expected paths outside the lock (platform calls), apply inside it.
             def servers = morpheusContext.services.computeServer.list(
-                new com.morpheusdata.core.data.DataQuery().withFilter(
-                    new com.morpheusdata.core.data.DataFilter('vmHypervisor', false)))
-            def moved = 0
+                userQuery(model).withFilter(new DataFilter('vmHypervisor', false))
+            ).toList().findAll { canAccess(model, it) }
+            def expected = [:]
             servers.each { s ->
-                def vid = s.id?.toString()
-                def currentPath = assignments[vid]
-                if (!currentPath || currentPath == '/') return
-                def segments = currentPath.split('/').findAll { it }
-                if (segments.size() < 2) return
-                // Only update if this looks like an auto-organized path (cloud/host)
                 def hostName = (s.parentServer?.name instanceof String ? s.parentServer?.name : s.parentServer?.name?.toString()) ?: ''
                 def cloudName = (s.cloud instanceof String ? s.cloud : s.cloud?.name?.toString()) ?: ''
-                if (!hostName || !cloudName) return
-                def expectedPath = '/' + cloudName.replace('/', '-') + '/' + hostName.replace('/', '-')
-                if (currentPath != expectedPath) {
-                    assignments[vid] = expectedPath
-                    moved++
-                }
+                if (hostName && cloudName) expected[s.id?.toString()] = '/' + cloudName.replace('/', '-') + '/' + hostName.replace('/', '-')
             }
-            if (moved > 0) {
-                db.assignments = assignments
-                writeDb(db)
+            def moved = 0
+            mutateDb { Map db ->
+                def assignments = db.assignments as Map ?: [:]
+                expected.each { vid, expectedPath ->
+                    def currentPath = assignments[vid]
+                    if (!currentPath || currentPath == '/') return
+                    // Only update if this looks like an auto-organized path (cloud/host)
+                    if (currentPath.split('/').findAll { it }.size() < 2) return
+                    if (currentPath != expectedPath) { assignments[vid] = expectedPath; moved++ }
+                }
+                if (moved > 0) { db.assignments = assignments; return true }
+                return false
             }
             return JsonResponse.of([success:true, moved:moved, message:"Re-synced ${moved} VM(s)"])
         } catch(e) {

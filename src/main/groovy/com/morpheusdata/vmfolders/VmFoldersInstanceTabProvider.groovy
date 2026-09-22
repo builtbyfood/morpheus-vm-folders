@@ -6,6 +6,7 @@ import com.morpheusdata.core.Plugin
 import com.morpheusdata.model.Account
 import com.morpheusdata.model.Instance
 import com.morpheusdata.model.User
+import com.morpheusdata.model.TaskConfig
 import com.morpheusdata.views.HTMLResponse
 import com.morpheusdata.views.ViewModel
 import groovy.util.logging.Slf4j
@@ -45,16 +46,26 @@ class VmFoldersInstanceTabProvider extends AbstractInstanceTabProvider {
     HTMLResponse renderTemplate(Instance instance) {
         try {
             ViewModel<Map> model = new ViewModel<>()
-            // Get the primary server ID from the instance containers
+            // Primary server id: buildInstanceConfig first, then the first workload's server
+            // (on 9.0.2 buildInstanceConfig yields no server id; the containers path does).
             def serverId = ''
             try {
-                def containers = instance.containers
-                if (containers) {
-                    def first = containers.find()
-                    serverId = first?.server?.id?.toString() ?: first?.serverId?.toString() ?: ''
-                }
+                TaskConfig config = morpheusContext.buildInstanceConfig(instance, [:], null, [], [:]).blockingGet()
+                serverId = config?.server?.id?.toString() ?: config?.serverId?.toString() ?: ''
             } catch(ex) {
-                log.warn("VmFoldersInstanceTabProvider: could not get serverId from instance ${instance?.id}: ${ex.message}")
+                log.warn("VmFoldersInstanceTabProvider: buildInstanceConfig failed: ${ex.message}")
+            }
+            if (!serverId) {
+                // Fallback: first workload's server
+                try {
+                    def containers = instance?.containers
+                    if (containers) {
+                        def first = containers.find()
+                        serverId = first?.server?.id?.toString() ?: ''
+                    }
+                } catch(ex2) {
+                    log.warn("VmFoldersInstanceTabProvider: could not get serverId from containers: ${ex2.message}")
+                }
             }
             model.object = [
                 instanceId  : instance?.id ?: 0,

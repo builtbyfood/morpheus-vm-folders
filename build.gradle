@@ -56,9 +56,9 @@ jar {
             'Morpheus-Name': 'VM Folders',
             'Morpheus-Organization': 'Travis DeLuca',
             'Morpheus-Code': 'vm-folders-plugin',
-            'Morpheus-Description': 'Folder organization for VMs in HPE Morpheus VM Essentials',
+            'Morpheus-Description': 'Folder organization for VMs in HPE Morpheus',
             'Morpheus-Labels': 'Plugin, UI, Infrastructure',
-            'Morpheus-Repo': 'https://github.com/builtbyfood/morpheus-vm-folders',
+            'Morpheus-Repo': 'https://github.com/builtbyfood/morpheus-vm-folders-plugin',
             'Morpheus-Min-Appliance-Version': '8.1.0'
         )
     }

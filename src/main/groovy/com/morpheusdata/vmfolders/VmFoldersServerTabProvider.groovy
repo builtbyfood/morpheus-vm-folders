@@ -52,9 +52,12 @@ class VmFoldersServerTabProvider extends AbstractServerTabProvider {
     HTMLResponse renderTemplate(ComputeServer server) {
         try {
             ViewModel<Map> model = new ViewModel<>()
+            def cloudName = ''
+            try { cloudName = (server?.cloud instanceof String ? server?.cloud : server?.cloud?.name?.toString()) ?: '' } catch(ex) {}
             model.object = [
                 serverId  : server?.id ?: 0,
                 serverName: server?.name ?: 'Host',
+                cloudName : cloudName,
                 pluginUrl : '/plugin/vmFolders'
             ]
             return getRenderer().renderTemplate('hbs/vmFoldersServerTab', model)

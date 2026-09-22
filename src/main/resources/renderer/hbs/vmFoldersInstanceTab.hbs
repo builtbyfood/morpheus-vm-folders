@@ -27,12 +27,12 @@
   .vmf-inst-move-form input:focus { outline:none; border-color:#01A982; }
 </style>
 
-<div id="vmf-inst-wrap">
+<div id="vmf-inst-wrap" data-server-id="{{serverId}}" data-instance-name="{{instanceName}}" data-plugin-url="{{pluginUrl}}">
   <div class="vmf-inst-card">
     <div class="vmf-inst-head">
       <h3>VM Folders</h3>
-      <span style="font-size:11px;color:#B0BEC5;">{{object.instanceName}}</span>
-      <a href="{{object.pluginUrl}}" target="_blank"
+      <span style="font-size:11px;color:#B0BEC5;">{{instanceName}}</span>
+      <a href="{{pluginUrl}}" target="_blank"
          style="margin-left:auto;font-size:11px;color:#B0BEC5;text-decoration:none;border:1px solid rgba(255,255,255,.3);padding:3px 8px;border-radius:3px;">
         Full View ↗
       </a>
@@ -50,9 +50,13 @@
 
 <script nonce="{{nonce}}">
 (function() {
-  var serverId = '{{object.serverId}}';
-  var instanceName = '{{object.instanceName}}';
-  var pluginUrl = '{{object.pluginUrl}}';
+  // Read model values from attributes (HTML-escaped by Handlebars) rather than
+  // interpolating them into JS string literals.
+  var wrapEl = document.getElementById('vmf-inst-wrap');
+  var ds = (wrapEl && wrapEl.dataset) || {};
+  var serverId = ds.serverId || '';
+  var instanceName = ds.instanceName || '';
+  var pluginUrl = ds.pluginUrl || '/plugin/vmFolders';
 
   function render(folder) {
     var isOrg = folder && folder !== '/';
@@ -94,6 +98,25 @@
     if (f) f.style.display = f.style.display === 'none' || !f.style.display ? 'block' : 'none';
   };
 
+  // POST helper. Prefer the shared implementation from vmFolders.js (injected on
+  // every core page by VmFoldersNavProvider); fall back to a local one that
+  // reads core's Spring Security CSRF meta tag, which is always present here
+  // because this tab renders inside the core layout.
+  function vmfPost(path, params) {
+    if (typeof window.vmfPost === 'function') return window.vmfPost(path, params);
+    var body = new URLSearchParams();
+    Object.keys(params).forEach(function(k) { body.append(k, String(params[k])); });
+    var headers = { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8', 'X-VMF-Request': '1' };
+    var meta = document.querySelector('meta[name="_csrf"]');
+    var hdr  = document.querySelector('meta[name="_csrf_header"]');
+    if (meta && meta.content) headers[(hdr && hdr.content) || 'X-XSRF-TOKEN'] = meta.content;
+    return fetch('/plugin/vmFolders' + path, { method: 'POST', credentials: 'same-origin', headers: headers, body: body.toString() })
+      .then(function(r) {
+        if (r.redirected && /invalid-csrf/.test(r.url)) return { success: false, error: 'rejected by server CSRF check (reload the page and retry)' };
+        return r.json();
+      });
+  }
+
   window.vmfInstSave = async function() {
     var el = document.getElementById('vmf-inst-fp');
     if (!el || !serverId) return;
@@ -101,8 +124,7 @@
     if (!path) return;
     if (!path.startsWith('/')) path = '/' + path;
     try {
-      var r = await fetch('/plugin/vmFolders/assign?vmId=' + serverId + '&path=' + encodeURIComponent(path));
-      var d = await r.json();
+      var d = await vmfPost('/assign', {vmId: serverId, path: path});
       if (d.success) { render(path); } else { alert('Failed: ' + d.error); }
     } catch(e) { alert('Error: ' + e.message); }
   };
@@ -111,8 +133,7 @@
     if (!serverId) return;
     if (!confirm('Remove from folder?')) return;
     try {
-      var r = await fetch('/plugin/vmFolders/unassign?vmId=' + serverId);
-      var d = await r.json();
+      var d = await vmfPost('/unassign', {vmId: serverId});
       if (d.success) { render(''); } else { alert('Failed: ' + d.error); }
     } catch(e) { alert('Error: ' + e.message); }
   };

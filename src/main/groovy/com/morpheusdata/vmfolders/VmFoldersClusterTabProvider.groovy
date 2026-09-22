@@ -49,9 +49,22 @@ class VmFoldersClusterTabProvider extends AbstractClusterTabProvider {
     HTMLResponse renderTemplate(ComputeServerGroup server) {
         try {
             ViewModel<Map> model = new ViewModel<>()
+            def cloudName = ''
+            try {
+                // ComputeServerGroup cloud properties vary — try all paths
+                ['zone','cloud','computeZone','masterZone'].each { prop ->
+                    if (!cloudName) {
+                        try {
+                            def val = server?.hasProperty(prop) ? server[prop] : null
+                            if (val) cloudName = (val instanceof String ? val : val?.name?.toString()) ?: ''
+                        } catch(ignore) {}
+                    }
+                }
+            } catch(ex) {}
             model.object = [
                 serverId  : server?.id ?: 0,
                 serverName: server?.name ?: 'Cluster',
+                cloudName : cloudName,
                 pluginUrl : '/plugin/vmFolders'
             ]
             return getRenderer().renderTemplate('hbs/vmFoldersClusterTab', model)

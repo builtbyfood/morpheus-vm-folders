@@ -42,15 +42,21 @@
   #vmf-st .vmf-act:hover { border-color:#01A982 !important; color:#008567 !important; }
   #vmf-st .vmf-act-more { font-weight:bold; letter-spacing:1px; }
   #vmf-st .vmf-pw-btn { color:#fff !important; }
+  #vmf-st .vmf-start-btn { background:#01A982 !important; border-color:#008567 !important; color:#fff !important; padding:2px 7px !important; font-size:11px !important; border-radius:3px !important; line-height:1.4 !important; }
+  #vmf-st .vmf-stop-btn  { background:#c00    !important; border-color:#a00    !important; color:#fff !important; padding:2px 7px !important; font-size:11px !important; border-radius:3px !important; line-height:1.4 !important; }
+  #vmf-st .vmf-start-btn:hover { background:#008567 !important; }
+  #vmf-st .vmf-stop-btn:hover  { background:#a00    !important; }
   #vmf-st .vmf-empty, #vmf-st .vmf-spin { display:flex; align-items:center; justify-content:center; padding:30px; color:var(--hpe-muted,#767676); font-family:-apple-system,sans-serif; gap:8px; font-size:12px; }
   #vmf-st .vmf-spinner { width:14px; height:14px; border:2px solid var(--hpe-border,#CCCCCC); border-top-color:#01A982; border-radius:50%; animation:vmfSpin .7s linear infinite; }
   @keyframes vmfSpin { to { transform:rotate(360deg); } }
+  .vmf-badge-un { display:inline-block; background:#fff3e0; color:#8a5300; border:1px solid #f0c890; border-radius:3px; padding:0 5px; font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:.03em; vertical-align:middle; }
+  body.dark .vmf-badge-un { background:#3A2E1A; color:#E0B870; border-color:#5A4828; }
 </style>
 
-<div id="vmf-st">
+<div id="vmf-st" data-server-id="{{serverId}}" data-server-name="{{serverName}}">
   <div id="vmf-st-hdr">
     <h3>VM Folders</h3>
-    <span class="vmf-hbadge">{{object.serverName}}</span>
+    <span class="vmf-hbadge">{{serverName}}</span>
     <button class="vmf-hbtn" id="vmf-resync-btn" title="Re-sync VMs to current host folders">&#8635; Re-sync</button>
     <a href="/plugin/vmFolders" target="_blank" class="vmf-hbtn" style="text-decoration:none;margin-left:auto;">Open Full View ↗</a>
   </div>
@@ -73,12 +79,35 @@
 
 <script nonce="{{nonce}}">
   window.vmfReadOnly = true;
-  window.vmfHostId = '{{object.serverId}}';
+  // Model values come from data-* attributes on #vmf-st (never interpolate into JS literals)
+  window.vmfHostId = (function() {
+    var el = document.getElementById('vmf-st');
+    return (el && el.dataset && el.dataset.serverId) || '';
+  })();
+  // Read cloud name from Morpheus 8.x DOM — confirmed selector: .info-column a[href*="clouds"]
+  window.vmfContextCloud = (function() {
+    try {
+      // Prefer the label-aware detection shared in vmFolders.js: a link-only match
+      // also hits the Group row, which put a group name in the cloud filter.
+      if (typeof window.vmfDetectContextCloud === 'function') {
+        var labelled = window.vmfDetectContextCloud();
+        if (labelled) return labelled;
+      }
+      var ic = document.querySelector('.info-column a[href*="/infrastructure/clouds/"]');
+      if (ic) return ic.textContent.trim();
+      // Fallback: take any cloud link that isn't in the main nav
+      var all = document.querySelectorAll('a[href*="/infrastructure/clouds/"]');
+      for (var i = 0; i < all.length; i++) {
+        if (!all[i].closest('nav, header, #main-nav, .main-nav, .navbar')) {
+          return all[i].textContent.trim();
+        }
+      }
+    } catch(e) {}
+    return '';
+  })();
 
   function vmfInitServerTab() {
-    // Rename wrapper div to match vmFolders.js expected IDs
-    var wrap = document.getElementById('vmf-st');
-    if (wrap) { wrap.id = 'vmf-server-tab-wrap'; }
+
     var rsync = document.getElementById('vmf-resync-btn');
     if (rsync) rsync.addEventListener('click', function() {
       if (typeof vmfResyncHosts === 'function') vmfResyncHosts();
