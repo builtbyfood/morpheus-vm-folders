@@ -19,7 +19,7 @@ class VmFoldersPlugin extends Plugin {
         this.name        = 'VM Folders'
         this.description = 'Folder organization for VMs in HPE Morpheus VM Essentials, Advanced, Enterprise'
         this.author      = 'Travis DeLuca'
-        this.version     = '1.4.1'
+        this.version     = '1.5.4'
 
         // Datastore scanning (1.4.0) is OFF until an administrator turns it on: it runs
         // read-only commands on hypervisor hosts through the Morpheus agent.
@@ -35,6 +35,48 @@ class VmFoldersPlugin extends Plugin {
                 displayOrder : 0,
                 required     : false,
                 helpText     : 'Allows the VM Folders dashboard to list what is on a datastore by running read-only find/head commands on a hypervisor host via the Morpheus agent. Off by default.'
+            ),
+            // vmfolder tag reconciliation (1.5.0) is OFF until an administrator turns it
+            // on. `consume` is the only mode that writes to a Morpheus record: it deletes
+            // the vmfolder tag from the VM once the folder has been assigned.
+            // A SELECT here would need an option source, so this is a text field and the
+            // value is validated in the controller (anything unrecognised means off).
+            // The dashboard's Settings dialog offers the same three values as a dropdown.
+            new OptionType(
+                name         : 'vmfolder tag mode',
+                code         : 'vm-folders-tag-mode',
+                fieldName    : 'tagMode',
+                fieldLabel   : 'vmfolder tag mode',
+                fieldContext : 'config',
+                inputType    : OptionType.InputType.TEXT,
+                defaultValue : 'off',
+                displayOrder : 1,
+                required     : false,
+                helpText     : 'off, keep or consume. off (default) ignores vmfolder tags entirely. keep assigns the VM to the tagged folder and leaves the tag in place, so the tag stays the source of truth — read-only, nothing in Morpheus is modified. consume assigns the VM and then REMOVES the vmfolder tag from the VM; no other tag is touched.'
+            ),
+            new OptionType(
+                name         : 'Label for all VMs',
+                code         : 'vm-folders-label-all',
+                fieldName    : 'labelAll',
+                fieldLabel   : 'Label for all VMs',
+                fieldContext : 'config',
+                inputType    : OptionType.InputType.TEXT,
+                defaultValue : 'All VMs',
+                displayOrder : 2,
+                required     : false,
+                helpText     : 'Display name for the root entry in the folder tree. Leave blank for "All VMs".'
+            ),
+            new OptionType(
+                name         : 'Label for unorganized VMs',
+                code         : 'vm-folders-label-unorganized',
+                fieldName    : 'labelUnorganized',
+                fieldLabel   : 'Label for unorganized VMs',
+                fieldContext : 'config',
+                inputType    : OptionType.InputType.TEXT,
+                defaultValue : 'Unorganized',
+                displayOrder : 3,
+                required     : false,
+                helpText     : 'Display name for VMs that are in no folder. Leave blank for "Unorganized".'
             )
         ]
 
@@ -53,7 +95,7 @@ class VmFoldersPlugin extends Plugin {
         // InstanceTabProvider — Provisioning → Instances → (instance) → VM Folders tab
         registerProvider(new VmFoldersInstanceTabProvider(this, morpheus))
 
-        log.info("VM Folders Plugin 1.4.1 initialized")
+        log.info("VM Folders Plugin 1.5.4 initialized")
     }
 
     Boolean hasCustomRenderer() { return true }

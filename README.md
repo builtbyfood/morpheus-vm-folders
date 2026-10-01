@@ -19,8 +19,12 @@ Current version: **1.4.1** · target platform: **Morpheus 9.0.2** · plugin API 
 - **Datastore scanning** (off by default) — lists what is actually on a datastore:
   VM directories Morpheus does not know about, disk-only directories, orphaned
   volume files, and other clutter
+- **Folder from a tag at provisioning time** (off by default) — a VM tagged
+  `vmfolder` = `/prod/web` is filed under `/prod/web`, so the provisioning wizard,
+  the API and Terraform can all choose the folder up front
 - **Auto-Organize** — builds a Cloud/Host folder hierarchy and assigns every VM
-- **Re-sync Hosts** — updates Cloud/Host folder assignments after a live migration
+- **Re-sync Hosts** — updates Cloud/Host folder assignments after a live migration,
+  and keeps using folders you have renamed instead of recreating the old ones
 - **Power actions and console** links inline in the VM table
 - **Backup / Restore / Export** of the folder database
 
@@ -33,6 +37,7 @@ Current version: **1.4.1** · target platform: **Morpheus 9.0.2** · plugin API 
 - `unmanaged` badge on VMs discovered on the hypervisor rather than provisioned
   by Morpheus — labelled only, all actions remain available
 - Live search across name, IP, OS, cloud and datastore
+- Configurable labels for the two root entries (`All VMs`, `Unorganized`)
 - Dark mode that follows the Morpheus theme
 - Tenant-scoped: users only ever see VMs their account can access
 
@@ -54,6 +59,137 @@ behind and touches nothing in Morpheus.
 Trade-off: because assignments are keyed by compute server id in a plugin-owned
 file, they are not visible to the Morpheus API or to other plugins. Use
 **Export** for an external copy.
+
+## Folder assignment from a `vmfolder` tag
+
+**Off by default.** A VM carrying the tag `vmfolder` with a folder path as its value —
+`vmfolder` = `/prod/web` — is filed under that folder. The tag can be set in the
+provisioning wizard's Tags step, through `PUT /api/instances/:id`, or by Terraform, all of
+which exist on VM Essentials, Advanced and Enterprise. (Inputs and option lists are
+Enterprise-only, so they are not used.)
+
+The tag name is matched case-insensitively and its value is normalized the same way as a
+folder created by hand. An unusable value is logged and skipped, leaving both the VM and
+the tag alone so the mistake can be seen and corrected. If a VM somehow carries several
+`vmfolder` tags, the first is used and a warning is logged. The direction is one-way: the
+plugin never writes a `vmfolder` tag, and moving a VM in the dashboard never creates one.
+
+Reconciliation runs when the dashboard loads and when Re-sync is pressed. A VM that is
+still being built is skipped, so a tag is never spent on a VM that may not finish.
+
+### Modes
+
+Set the mode in **⚙ Settings** on the dashboard, or as `vmfolder tag mode` in the plugin
+settings form under Admin → Plugins (the form wins when it holds a value).
+
+| Mode | Behaviour |
+|---|---|
+| `off` (default) | No tag is read. Nothing is logged. The feature is inert. |
+| `keep` | The VM is filed and the tag stays. **Read-only — no Morpheus record is modified.** The tag remains the source of truth: tagged VMs show a `tagged` badge, moving one in the dashboard warns that the move will be reverted on the next reconcile, and Re-sync leaves tagged VMs where the tag put them. This is the mode to use for Terraform-managed tags. |
+| `consume` | The VM is filed and the `vmfolder` tag is then **removed from the VM**. |
+
+`consume` is the **only** place this plugin writes to a Morpheus record. It deletes nothing
+but the `vmfolder` tag itself — other tags on the same record are untouched and no other
+field is written. Every removal is audit-logged with the user, the VM id and the path:
+
+```
+VmFolders tag consumed: user=<user> vm=<id> path=</prod/web> owner=server#<id> tags=1 removed=true via=...
+```
+
+The tag is read from the compute server record and, when that carries none, from the
+instance that owns it, and is removed from whichever record carried it.
+
+### Setting the tag
+
+The tag name is always `vmfolder`; the value is the folder path.
+
+**Provisioning wizard.** On the **Tags** step (VM Essentials: *Configure* page), add a tag
+with name `vmfolder` and value `/prod/web`.
+
+**Existing VM, UI.** Instance detail → **Edit** → Tags → add `vmfolder` = `/prod/web`.
+The next dashboard load files it.
+
+**API.** `addTags` adds without touching the VM's other tags; `tags` replaces the whole
+list, so prefer `addTags`:
+
+```
+curl -sk -X PUT "https://<appliance>/api/instances/<id>" \
+  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -d '{"instance":{"addTags":[{"name":"vmfolder","value":"/prod/web"}]}}'
+```
+
+**Terraform.** Put it in the instance resource's `tags` map — `tags = { vmfolder = "/prod/web" }`.
+Use `keep` mode: in `consume` the plugin deletes the tag and the next `terraform apply`
+puts it back.
+
+> The `addTags` field name and the Terraform resource for VME/KVM instances are taken from
+> the public Morpheus API and provider docs, not tested against 9.0.2 — confirm them with
+> the first test below before relying on them.
+
+### Tag values
+
+Values go through the same normalizer as a folder made by hand. Missing folders are created.
+
+| Tag value | Result |
+|---|---|
+| `/prod/web` | `/prod/web` |
+| `prod/web` | `/prod/web` (leading slash added) |
+| `/prod//web/` | `/prod/web` (duplicate and trailing slashes dropped) |
+| `  /prod/web  ` | `/prod/web` (trimmed) |
+| `/a/b/c/d/e/f/g/h` | accepted — 8 segments is the limit |
+| `/a/b/c/d/e/f/g/h/i` | **rejected** — more than 8 segments |
+| `../x`, `/a/./b` | **rejected** — `.` and `..` segments |
+| `/a\b` | **rejected** — backslash in a segment |
+| `/` or empty | **rejected** — not a folder |
+| a segment over 64 chars, or a path over 512 | **rejected** |
+
+A rejected value leaves the VM where it is and the tag in place, logs
+`VmFolders tag: vm=<id> (<name>) has an unusable vmfolder value [...]`, and is counted as
+`invalid` on the Re-sync toast.
+
+### Testing the tag feature
+
+Run these in order after upload; stop at the first one that fails. Watch the log with:
+
+```
+sudo tail -F /var/log/morpheus/morpheus-ui/current | grep --line-buffered "VmFolders"
+```
+
+1. **Loads.** `VM Folders Plugin <version> initialized`, no compile errors.
+2. **Off does nothing.** With `tagMode` = `off`, provision a VM tagged
+   `vmfolder=/tagtest/one` and load the dashboard. No `VmFolders tag` line, VM not filed,
+   tag still on the VM.
+3. **Probe.** Set `keep` in ⚙ Settings and reload. One line per load:
+   `VmFolders tag/probe: mode=keep servers=.. serverTagged=.. instanceTagged=.. ...`
+   `serverTagged` or `instanceTagged` > 0 → tags are readable, carry on. Both 0 on a VM
+   you know is tagged → `list()` does not load tags; stop and report the line.
+4. **Keep.** The VM is in `/tagtest/one`, shows the `tagged` badge, and the tag and its
+   other tags are still on it in Morpheus.
+5. **Keep wins.** Move it to `/b` in the dashboard (the dialog warns), press Re-sync → back
+   in `/tagtest/one`.
+6. **Invalid.** Tag a second VM `vmfolder=../x`, reload → VM unmoved, tag present, warning
+   logged, `invalid: 1` on the Re-sync toast.
+7. **API.** Add the tag to an existing untagged VM with the `curl` above → next load files it.
+8. **Consume.** Switch to `consume`, tag a VM `vmfolder=/tagtest/two` alongside another
+   tag, reload → filed in `/tagtest/two`, the `vmfolder` tag gone from the VM in the
+   Morpheus UI, the other tag still there, and one line
+   `VmFolders tag consumed: user=... vm=... path=</tagtest/two> ... removed=true`.
+   `removed=false` means the platform refused the delete; the VM is still filed.
+9. **Provision-time.** In `consume`, provision a new VM with the tag from the wizard and
+   keep the dashboard open during the build → it is not touched while provisioning and is
+   filed on the first load after it goes running.
+
+## Folder renames and `origin`
+
+An auto-created folder records where it came from — the cloud for a cloud folder, the cloud
+and host for a host folder. Re-sync and Auto-Organize resolve their targets by that origin
+rather than by name, so renaming `/managed-democracy` to `/Lab` keeps `/Lab` receiving the
+same VMs instead of having the old tree recreated underneath it. Folders you created by
+hand have no origin and Re-sync never touches them. Folders that predate 1.5.0 are matched
+to their cloud and host once, on the first read.
+
+Re-sync will also place a VM that is in no folder into its Cloud/Host folder when that
+folder already exists. It never creates a folder for an unassigned VM.
 
 ## Datastore scanning
 
@@ -159,9 +295,23 @@ Expect `VM Folders Plugin 1.4.1 initialized`.
 - **Host commands are fixed templates.** The only value interpolated into a scan command
   is the datastore path, taken from the platform record and allow-listed by pattern; the
   request is refused with 400 before any command runs if it does not match. `/scan` is a
-  mutation and passes through `requireMutation()`; `/scans` and `/scanConfig` are
+  mutation and passes through `requireMutation()`; `/scans` and `/config` are
   read-only and filtered to datastores the caller can see. One audit line is written per
   scan with user, datastore, host, elapsed time and counts.
+- **Folder paths are normalized and bounded.** One normalizer serves `saveFolder`,
+  `assign` and `renFolder`: control characters, `.` / `..` segments and a backslash inside
+  a segment are rejected, and the path is capped at 8 segments, 64 characters per segment
+  and 512 overall. Angle brackets and quotes are accepted on purpose — a hostile name is
+  allowed and is made safe by `esc()` on output.
+- **The one Morpheus write is opt-in and narrow.** Only `consume` tag mode modifies a
+  Morpheus record, only to delete the `vmfolder` tag, only on VMs the caller's tenant can
+  access, and always with an audit line. `keep` mode is read-only.
+- **Reconciliation does not run on an unauthenticated-looking GET.** It can write, and it
+  runs from `/vms`, which is a GET, so it only runs for a request carrying
+  `X-VMF-Request` — a header a cross-origin GET cannot set without a CORS preflight. A
+  plain browser GET of `/vms` stays strictly read-only.
+- **Settings writes are allow-listed.** `POST /setConfig` accepts three keys; `tagMode` is
+  validated against the three legal values and the labels are sanitized display strings.
 
 Routes are currently gated on the `admin-cm: full` permission. To widen access,
 change the `Permission.build(...)` call in `VmFoldersController.getRoutes()` —
@@ -187,7 +337,7 @@ src/main/groovy/com/morpheusdata/vmfolders/
   VmFoldersClusterTabProvider.groovy
   VmFoldersServerTabProvider.groovy
   VmFoldersInstanceTabProvider.groovy
-src/assets/javascript/vmFolders.js   SPA: tree, table, datastore view, scan panel, mutations
+src/assets/javascript/vmFolders.js   SPA: tree, table, datastore view, scan panel, settings, mutations
 src/main/resources/renderer/hbs/     tab templates
 ```
 
@@ -216,10 +366,16 @@ src/main/resources/renderer/hbs/     tab templates
 - A plugin-declared `vm-folders-scan` permission is not used, because whether Morpheus
   9.0.2 honors plugin-declared permissions is unverified; scan routes share the same
   `admin-cm` permission as everything else.
+- **`vmfolder` tags are read one way only.** Moving a VM in the dashboard never creates or
+  updates a tag, so in `keep` mode the tag and the dashboard can disagree — and the tag
+  wins on the next reconcile. There is no alias table for a renamed folder: a tag naming
+  the old path moves the VM back, and the rename dialog says how many VMs that affects.
+- **Tag reconciliation costs one extra query per load** when it is not `off`: the instance
+  list, so a tag the platform put on the instance rather than the server is still found.
 - No automated tests; verification is the manual checklist in `CLAUDE.md`.
 
 ## Changelog
 
 See [CHANGELOG.md](CHANGELOG.md). Notable releases: **1.1.5** (security
 hardening, core CSRF, embedded-tab fixes), **1.2.0** (datastore visibility and
-browsing), **1.3.6** (unmanaged labelling, datastore bucket fix, embedded-tab state fixes), **1.4.1** (datastore scanning).
+browsing), **1.3.6** (unmanaged labelling, datastore bucket fix, embedded-tab state fixes), **1.4.1** (datastore scanning), **1.5.0** (`vmfolder` tag at provisioning time, durable folder renames).

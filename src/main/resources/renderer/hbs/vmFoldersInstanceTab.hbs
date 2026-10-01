@@ -57,12 +57,15 @@
   var serverId = ds.serverId || '';
   var instanceName = ds.instanceName || '';
   var pluginUrl = ds.pluginUrl || '/plugin/vmFolders';
+  // Root labels are a plugin setting (1.5.0). Default matches earlier releases, so a
+  // failed /config fetch changes nothing here.
+  var labelUnorganized = 'Unorganized';
 
   function render(folder) {
     var isOrg = folder && folder !== '/';
     var folderDisplay = isOrg
       ? '<span class="vmf-inst-val folder">&#128193; ' + esc(folder) + '</span>'
-      : '<span class="vmf-inst-val unorg">Unorganized</span>';
+      : '<span class="vmf-inst-val unorg">' + esc(labelUnorganized) + '</span>';
 
     var html = '<div class="vmf-inst-row">' +
       '<span class="vmf-inst-label">Instance</span>' +
@@ -138,8 +141,13 @@
     } catch(e) { alert('Error: ' + e.message); }
   };
 
-  // Load current folder from DB
-  fetch('/plugin/vmFolders/db').then(function(r) { return r.json(); }).then(function(db) {
+  // Load current folder from the DB, and the display labels from /config.
+  Promise.all([
+    fetch('/plugin/vmFolders/db').then(function(r) { return r.json(); }),
+    fetch('/plugin/vmFolders/config').then(function(r) { return r.json(); }).catch(function() { return {}; })
+  ]).then(function(res) {
+    var db = res[0] || {}, cfg = res[1] || {};
+    if (cfg.labelUnorganized) labelUnorganized = cfg.labelUnorganized;
     var assignments = db.assignments || {};
     var folder = serverId ? (assignments[serverId] || '') : '';
     render(folder);

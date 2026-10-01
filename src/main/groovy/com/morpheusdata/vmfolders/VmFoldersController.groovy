@@ -29,7 +29,7 @@ class VmFoldersController implements PluginController {
 
     static final String DATA_DIR  = '/var/opt/morpheus/morpheus-ui/plugins'
     static final String DB_FILE   = "${DATA_DIR}/vm-folders.json"
-    static final String VERSION   = '1.4.1'
+    static final String VERSION   = '1.5.4'
     static final String BAK_FILE  = "${DATA_DIR}/vm-folders.json.bak"
 
     VmFoldersController(Plugin plugin, MorpheusContext morpheusContext) {
@@ -64,11 +64,16 @@ class VmFoldersController implements PluginController {
             p("/vmFolders/resync",          "resync"),
             p("/vmFolders/logs",      "logs"),
             // 1.4.0 datastore scan. `scan` runs a command on a host and is a mutation;
-            // `scans` and `scanConfig` are read-only.
+            // `scans` is read-only.
             p("/vmFolders/scan",       "scan"),
             p("/vmFolders/scans",      "scans"),
-            p("/vmFolders/scanConfig", "scanConfig"),
-            p("/vmFolders/scanEnable", "scanEnable")
+            p("/vmFolders/scanEnable", "scanEnable"),
+            // 1.5.0. `config` is read-only and replaces `scanConfig` (it carries the
+            // scan keys plus tagMode and the root labels). `setConfig` and
+            // `autoOrganize` are mutations.
+            p("/vmFolders/config",       "config"),
+            p("/vmFolders/setConfig",    "setConfig"),
+            p("/vmFolders/autoOrganize", "autoOrganize")
         ]
     }
 
@@ -201,6 +206,503 @@ class VmFoldersController implements PluginController {
         db.history = h
     }
 
+    // ══ Settings (1.5.0) ═══════════════════════════════════════════════
+    // Two stores, in this order: the plugin's own settings form (Admin → Plugins), then
+    // a key in the plugin database written through the permission-gated setConfig route.
+    // The form wins when it holds a value, so an administrator can always override the
+    // dashboard. Whether the settings form is usable on this platform is still
+    // unverified (see the 1.4.0 notes), which is why the database fallback exists.
+    static final String TAG_MODE_SETTING   = 'tagMode'
+    static final String LABEL_ALL_SETTING  = 'labelAll'
+    static final String LABEL_UNORG_SETTING = 'labelUnorganized'
+    static final List<String> TAG_MODES    = ['off', 'keep', 'consume']
+    static final String LABEL_ALL_DEFAULT  = 'All VMs'
+    static final String LABEL_UNORG_DEFAULT = 'Unorganized'
+    static final int MAX_LABEL_LEN = 40
+
+    // One request reads several settings, so the platform call is memoized briefly.
+    // Only the settings FORM is cached; the plugin database is re-read every time, so a
+    // change made in the dashboard is visible immediately.
+    static final long SETTINGS_TTL_MS = 5000L
+    private volatile Map settingsCache = null
+    private volatile long settingsCacheAt = 0L
+
+    /** The plugin settings form as a map; empty when it is unreadable or unset. */
+    private Map pluginSettings() {
+        def now = System.currentTimeMillis()
+        def cached = settingsCache
+        if (cached != null && (now - settingsCacheAt) < SETTINGS_TTL_MS) return cached
+        def out = [:]
+        try {
+            def raw = morpheusContext.getSettings(plugin)?.blockingGet()
+            if (raw) {
+                def parsed = new JsonSlurper().parseText(raw as String)
+                if (parsed instanceof Map) out = parsed
+            }
+        } catch(ex) { log.debug("VmFolders: plugin settings unreadable (${ex.message}); using the local store") }
+        settingsCache = out
+        settingsCacheAt = now
+        return out
+    }
+
+    /** [value, source] where source is 'plugin', 'db' or 'default'. */
+    private List settingWithSource(String key, String dflt) {
+        def v = pluginSettings()[key]
+        if (v != null && !v.toString().trim().isEmpty()) return [v.toString().trim(), 'plugin']
+        try {
+            def local = readDb()?.settings?.get(key)
+            if (local != null && !local.toString().trim().isEmpty()) return [local.toString().trim(), 'db']
+        } catch(ex) {}
+        return [dflt, 'default']
+    }
+
+    /** off | keep | consume. Anything unrecognised is off — the feature fails closed. */
+    private String tagMode() {
+        def m = settingWithSource(TAG_MODE_SETTING, 'off')[0].toLowerCase()
+        return TAG_MODES.contains(m) ? m : 'off'
+    }
+
+    private String labelAll()   { sanitizeLabel(settingWithSource(LABEL_ALL_SETTING,  LABEL_ALL_DEFAULT)[0],  LABEL_ALL_DEFAULT) }
+    private String labelUnorg() { sanitizeLabel(settingWithSource(LABEL_UNORG_SETTING, LABEL_UNORG_DEFAULT)[0], LABEL_UNORG_DEFAULT) }
+
+    /** Display-only label: control chars out, length capped. esc() still applies on output. */
+    private static String sanitizeLabel(String raw, String dflt) {
+        if (raw == null) return dflt
+        def clean = raw.replaceAll(/\p{Cntrl}/, '').trim()
+        if (clean.length() > MAX_LABEL_LEN) clean = clean.substring(0, MAX_LABEL_LEN)
+        return clean ?: dflt
+    }
+
+    // ══ Folder paths ═══════════════════════════════════════════════════
+    static final int MAX_PATH_DEPTH   = 8
+    static final int MAX_SEGMENT_LEN  = 64
+    static final int MAX_PATH_LEN     = 512
+
+    /**
+     * The canonical form of a folder path, or null when the value cannot be one.
+     * Trims, forces a leading slash, collapses duplicate slashes, drops a trailing
+     * slash, and rejects control characters, '.' / '..' segments, a backslash inside a
+     * segment, over-long segments and over-deep paths. Returns '/' for an empty path
+     * (the root — callers that need a real folder must check for it).
+     *
+     * Angle brackets and quotes are deliberately NOT rejected: a hostile folder name is
+     * allowed and is made safe by esc() at render time, which is what the verification
+     * checklist tests.
+     */
+    private static String normPath(String raw) {
+        if (raw == null) return null
+        def s = raw.trim()
+        if (!s) return null
+        if (s.length() > MAX_PATH_LEN) return null
+        if (s =~ /\p{Cntrl}/) return null
+        def segs = []
+        s.split('/').each { part ->
+            def seg = part?.trim()
+            if (seg) segs << seg
+        }
+        if (!segs) return '/'
+        if (segs.size() > MAX_PATH_DEPTH) return null
+        for (seg in segs) {
+            if (seg == '.' || seg == '..') return null
+            if (seg.length() > MAX_SEGMENT_LEN) return null
+            if (seg.contains('\\')) return null
+        }
+        return '/' + segs.join('/')
+    }
+
+    /** A cloud or host name reduced to one path segment. */
+    private static String pathSeg(String name) {
+        def seg = (name ?: '').replace('/', '-').replace('\\', '-').replaceAll(/\p{Cntrl}/, '').trim()
+        if (seg.length() > MAX_SEGMENT_LEN) seg = seg.substring(0, MAX_SEGMENT_LEN)
+        return seg
+    }
+
+    // On VME-managed VMs these arrive as a String on some records and an object on
+    // others — both shapes have to be handled (see CLAUDE.md).
+    private static String cloudNameOf(def s) {
+        try { return ((s.cloud instanceof String) ? s.cloud : s.cloud?.name)?.toString() ?: '' } catch(ex) { return '' }
+    }
+    private static String hostNameOf(def s) {
+        try { def n = s.parentServer?.name; return ((n instanceof String) ? n : n?.toString()) ?: '' } catch(ex) { return '' }
+    }
+
+    // ══ Folder origin (1.5.0) ══════════════════════════════════════════
+    // An auto-created folder records WHERE it came from: {cloud: 'x'} for a cloud
+    // folder, {cloud: 'x', host: 'y'} for a host folder. Re-sync resolves targets by
+    // origin instead of by name, so renaming /managed-democracy to /Lab no longer makes
+    // the next Re-sync recreate the old tree and drag every VM back into it.
+    //
+    // A folder with no origin was made by hand and Re-sync never touches it.
+
+    /**
+     * Stamps `origin` on folder records that still match a cloud or cloud/host name, so
+     * folders created before 1.5.0 are migrated. Each record is examined once
+     * (`originChecked`), on the read path, inside the caller's mutateDb.
+     *
+     * Depth 2 under a known cloud counts as a host folder even when the host segment
+     * matches no current host: after a migration the last VM can leave a host, and a
+     * folder that lost its origin that way would strand the VMs still assigned to it.
+     *
+     * Returns true when it changed the db.
+     */
+    private boolean stampOrigins(Map db, List servers) {
+        def folders = db.folders as List ?: []
+        if (!folders.any { (it instanceof Map) && it.originChecked != true }) return false
+        def clouds = [:]     // cloud segment -> real cloud name
+        def hosts  = [:]     // "cloudSeg/hostSeg" -> [cloud: , host: ]
+        servers.each { s ->
+            def c = cloudNameOf(s), h = hostNameOf(s)
+            if (c) clouds[pathSeg(c)] = c
+            if (c && h) hosts[pathSeg(c) + '/' + pathSeg(h)] = [cloud: c, host: h]
+        }
+        boolean changed = false
+        folders.each { f ->
+            if (!(f instanceof Map)) return
+            if (f.originChecked == true) return
+            f.originChecked = true
+            changed = true
+            if (f.origin != null) return
+            def segs = (f.path ?: '').toString().split('/').findAll { it }
+            if (segs.size() == 1) {
+                if (clouds[segs[0]]) f.origin = [cloud: clouds[segs[0]]]
+            } else if (segs.size() == 2 && clouds[segs[0]]) {
+                def exact = hosts[segs[0] + '/' + segs[1]]
+                f.origin = exact ?: [cloud: clouds[segs[0]], host: segs[1]]
+            }
+        }
+        if (changed) db.folders = folders
+        return changed
+    }
+
+    /**
+     * The folder a VM on {cloud, host} belongs in, resolved by origin. With create=true
+     * the folder (and its cloud parent) is created when no folder carries that origin —
+     * at the name-derived path, which is only ever used for a folder that does not exist
+     * yet. Mutates db.folders; the caller is inside mutateDb.
+     */
+    private String originTarget(Map db, String cloud, String host, boolean create) {
+        def folders = db.folders as List ?: []
+        def hit = folders.find { (it instanceof Map) && (it.origin instanceof Map) && it.origin.cloud == cloud && it.origin.host == host }
+        if (hit) return hit.path?.toString()
+        if (!create) return null
+        def parent = folders.find { (it instanceof Map) && (it.origin instanceof Map) && it.origin.cloud == cloud && !it.origin.host }
+        def parentPath = parent?.path?.toString() ?: ('/' + pathSeg(cloud))
+        if (!parent && !folders.find { (it instanceof Map) && it.path == parentPath }) {
+            folders << [path: parentPath, desc: '', created: new Date().toString(),
+                        origin: [cloud: cloud], originChecked: true]
+        }
+        def path = normPath(parentPath + '/' + pathSeg(host))
+        if (!path || path == '/') return null
+        def existing = folders.find { (it instanceof Map) && it.path == path }
+        if (existing) {
+            existing.origin = [cloud: cloud, host: host]
+            existing.originChecked = true
+        } else {
+            folders << [path: path, desc: '', created: new Date().toString(),
+                        origin: [cloud: cloud, host: host], originChecked: true]
+        }
+        db.folders = folders
+        return path
+    }
+
+    // ══ vmfolder tag reconciliation (1.5.0) ════════════════════════════
+    // A `vmfolder` tag whose value is a folder path puts a VM in that folder, so the
+    // provisioning wizard's Tags step, the API and Terraform can all set a folder at
+    // create time. One way only: the plugin never writes a vmfolder tag, and moving a VM
+    // in the dashboard never creates one.
+    //
+    // Verified against the 1.3.0 jar (2026-09-30):
+    //  - ComputeServer.metadata and Instance.metadata are List<MetadataTag>; MetadataTag
+    //    carries `name` and `value` (name comes from MetadataTagIdentityProjection,
+    //    which also carries refType/refId). ComputeServer.tags is a separate String
+    //    field and is NOT the tag list.
+    //  - MorpheusMetadataTagService (morpheusContext.async.metadataTag) has
+    //    remove(List<MetadataTagIdentityProjection>, ComputeServerIdentityProjection)
+    //    and the Instance equivalent; the synchronous service only has remove(List).
+    //    ComputeServer IS a ComputeServerIdentityProjection, so the server can be passed
+    //    straight in and Groovy picks the overload by runtime type.
+    //
+    // NOT verifiable without the appliance, hence the probe log line in reconcileTags():
+    //  - whether computeServer.list() hydrates `metadata` (as it does `volumes`),
+    //  - whether a provisioning-time tag lands on the ComputeServer, the Instance or
+    //    both — so both are read, and the tag is removed from whichever carried it.
+    static final String TAG_NAME = 'vmfolder'
+
+    /** Reconcile only runs for a request that came from the dashboard's own XHR.
+     *  It can write (consume mode removes a tag), and /vms is a GET, so the custom
+     *  header a cross-origin GET cannot set is what keeps CLAUDE.md rule 6 honest:
+     *  a plain browser GET of /vms stays strictly read-only. */
+    private boolean vmfXhr(ViewModel<Map> model) {
+        try { return header(model?.request, REQ_HEADER) != null } catch(ex) { return false }
+    }
+
+    /** The vmfolder tags on one record. Case-insensitive on the tag name. */
+    private static List tagsOn(def owner) {
+        def hits = []
+        try {
+            (owner?.metadata ?: []).each { t ->
+                def n = t?.name?.toString()?.trim()
+                if (n && n.equalsIgnoreCase(TAG_NAME)) hits << t
+            }
+        } catch(ex) {}
+        return hits
+    }
+
+    /** server id -> Instance, so a tag the platform put on the instance is still found. */
+    private Map instancesByServerId(ViewModel<Map> model) {
+        def map = [:]
+        try {
+            morpheusContext.services.instance.list(userQuery(model))?.each { inst ->
+                // canAccess() is applied here for the same reason it is applied to servers:
+                // DataQuery(user) sets the account but service-level scoping is not
+                // guaranteed, and consume mode removes a tag from whatever this returns.
+                if (!canAccess(model, inst)) return
+                boolean mapped = false
+                try {
+                    (inst.containers ?: []).each { w ->
+                        def sid = w?.server?.id
+                        if (sid != null && !map.containsKey(sid)) { map[sid] = inst; mapped = true }
+                    }
+                } catch(ex) {}
+                // containers is not hydrated by instance.list() on 9.0.2, so a tagged
+                // instance is mapped from the workload side instead. Only tagged instances
+                // pay for the query. This is what finds a tag that is on the instance only —
+                // e.g. after 1.5.2 removed the server copy and left the instance tag.
+                // [V] whether instance.list() hydrates metadata, and the 'instance.id' filter.
+                if (!mapped && tagsOn(inst)) {
+                    try {
+                        def w = morpheusContext.services.workload.find(new DataQuery().withFilter('instance.id', inst.id))
+                        def sid = w?.server?.id
+                        if (sid != null && w.instance?.id in [null, inst.id] && !map.containsKey(sid)) map[sid] = inst
+                        else log.info("VmFolders tag/probe: tagged instance#${inst.id} not mapped (workload=${w?.id} server=${sid} instance=${w?.instance?.id})")
+                    } catch(ex) {
+                        log.warn("VmFolders tag: workload lookup for instance#${inst.id} failed (${ex.class.name}: ${ex.message})")
+                    }
+                }
+            }
+        } catch(ex) { log.warn("VmFolders tag: instance list failed (${ex.class.name}: ${ex.message})") }
+        return map
+    }
+
+    /** The tag to act on for this VM, server record first, then its instance. */
+    private Map tagHit(def s, Map instByServerId) {
+        def hits = tagsOn(s)
+        def ownerType = 'server'
+        def owner = s
+        if (!hits) {
+            def inst = instByServerId?.get(s.id)
+            if (inst) {
+                def ih = tagsOn(inst)
+                if (ih) { hits = ih; ownerType = 'instance'; owner = inst }
+            }
+        }
+        if (!hits) return null
+        if (hits.size() > 1) {
+            log.warn("VmFolders tag: vm=${s.id} carries ${hits.size()} ${TAG_NAME} tags; using the first [${hits[0]?.value}]")
+        }
+        return [tag: hits[0], extra: hits.drop(1), ownerType: ownerType, owner: owner, server: s]
+    }
+
+    /**
+     * Whether a tag on this VM may be acted on yet. A VM still being built can carry the
+     * tag before the record is real, and consuming it then would spend the tag on a VM
+     * that may never finish. Only clearly in-flight states are skipped, so an
+     * unrecognised status never silently disables the feature.
+     *
+     * Exact matches only: 1.5.0–1.5.1 used substring checks, and 'provision' matched
+     * 'provisioned' — the normal status of every finished Morpheus-built VM — so every
+     * such VM was skipped as not ready.
+     */
+    static final Set<String> TAG_NOT_READY = ['provisioning', 'pending', 'queued', 'deploying', 'creating',
+                                              'resizing', 'removing', 'deprovisioning'] as Set
+    private static boolean tagReady(def s) {
+        try {
+            def st = s.status?.toString()?.trim()?.toLowerCase()
+            return !st || !TAG_NOT_READY.contains(st)
+        } catch(ex) { return true }
+    }
+
+    /**
+     * The Instance that owns this server, or null. Returns [instance, how-it-was-found].
+     *
+     * Instance.containers is NOT hydrated by instance.list() on 9.0.2 (1.5.2 probe:
+     * instancesMapped=0), so the link is resolved from the workload side: one workload
+     * query filtered by server.id, then workload.instance, then instance.get() for a
+     * fully loaded record. The server has already passed canAccess(); the instance is
+     * checked again before anything is removed from it.
+     * [V] Whether the 'server.id' filter path is honoured and workload.instance is
+     * populated is unverified — the consumed log line reports how the instance was
+     * found, or why it was not.
+     */
+    private List instanceForServer(ViewModel<Map> model, def s, Map instByServerId) {
+        def inst = instByServerId?.get(s.id)
+        if (inst) return [inst, 'instance.containers']
+        try {
+            def w = morpheusContext.services.workload.find(new DataQuery().withFilter('server.id', s.id))
+            if (!w) return [null, "no workload with server.id=${s.id}"]
+            if (w.server?.id != null && w.server.id != s.id) return [null, "workload#${w.id} belongs to server#${w.server.id} (filter ignored?)"]
+            def ref = w.instance
+            if (ref?.id == null) return [null, "workload#${w.id} has no instance"]
+            inst = morpheusContext.services.instance.get(ref.id as Long) ?: ref
+            if (!canAccess(model, inst)) return [null, "instance#${ref.id} not accessible to caller"]
+            return [inst, "workload#${w.id}.instance"]
+        } catch(ex) {
+            return [null, "workload lookup failed (${ex.class.simpleName}: ${ex.message})"]
+        }
+    }
+
+    /** vmfolder tags on an instance: its metadata, else a metadataTag query by ref.
+     *  [V] refType 'Instance' is the Morpheus convention but unverified on 9.0.2. */
+    private List instanceTags(def inst) {
+        def hits = tagsOn(inst)
+        if (hits) return [hits, 'instance.metadata']
+        try {
+            def q = new DataQuery().withFilter('refType', 'Instance').withFilter('refId', inst.id as Long)
+            hits = (morpheusContext.services.metadataTag.list(q) ?: []).findAll { t ->
+                t?.name?.toString()?.trim()?.equalsIgnoreCase(TAG_NAME)
+            }
+            return [hits, 'metadataTag.list(refType=Instance)']
+        } catch(ex) {
+            return [[], "metadataTag query failed (${ex.class.simpleName}: ${ex.message})"]
+        }
+    }
+
+    /** Removes the given tags from one owning record. Returns [removed, via]. */
+    private List removeFrom(List tags, def ref) {
+        def kind = ref?.getClass()?.simpleName
+        try {
+            def r = morpheusContext.async.metadataTag.remove(tags, ref)?.blockingGet()
+            if (r == true) return [true, "async.remove(tags, ${kind})"]
+            log.warn("VmFolders tag: async.remove(tags, ${kind}#${ref?.id}) returned ${r}; trying the plain remove")
+        } catch(ex) {
+            log.warn("VmFolders tag: async.remove(tags, ${kind}#${ref?.id}) failed (${ex.class.name}: ${ex.message}); trying the plain remove")
+        }
+        try {
+            return [morpheusContext.services.metadataTag.remove(tags) == true, 'services.remove(tags)']
+        } catch(ex) {
+            log.error("VmFolders tag: removal FAILED on ${kind}#${ref?.id}: ${ex.class.name}: ${ex.message}", ex)
+            return [false, "failed: ${ex.class.simpleName}"]
+        }
+    }
+
+    /**
+     * Removes the vmfolder tag from the VM: the server's copy and the instance's tag.
+     *
+     * THIS IS THE ONLY PLACE THE PLUGIN WRITES TO A MORPHEUS RECORD, and it runs only in
+     * consume mode. It deletes nothing but the vmfolder tag itself: other tags on either
+     * record are untouched. Every removal is audit-logged with the user, the VM, the path
+     * and the result on each record.
+     *
+     * On 9.0.2 a tag set on an instance (wizard, instances#update) is copied to its
+     * server's metadata, and the instance is the source the UI shows. Removing only the
+     * server copy (1.5.0–1.5.2) returned removed=true and left the tag visible, so the
+     * instance is resolved through its workload and its tag removed too. Success means
+     * the instance tag is gone, or — for a VM with no instance — the server tag is.
+     */
+    private boolean removeTag(ViewModel<Map> model, Map hit, Map instByServerId) {
+        def s = hit.server
+        def srvTags = tagsOn(s)
+        def srv = srvTags ? removeFrom(srvTags, s) : [null, 'no tag on server']
+        def (inst, found) = instanceForServer(model, s, instByServerId)
+        def ins = [null, 'no instance']
+        if (inst) {
+            def (instTags, src) = instanceTags(inst)
+            ins = instTags ? removeFrom(instTags, inst) + [src] : [null, "no ${TAG_NAME} tag on instance (${src})"]
+        }
+        boolean ok = (ins[0] == true) || (ins[0] == null && srv[0] == true)
+        log.info("VmFolders tag consumed: user=${model?.user?.username} vm=${hit.vmId} path=${hit.path} ok=${ok} | " +
+                 "server#${s?.id} tags=${srvTags.size()} removed=${srv[0]} via=${srv[1]} | " +
+                 "instance#${inst?.id ?: '-'} found=${found} removed=${ins[0]} via=${ins.drop(1).join(' / ')}")
+        if (!inst) {
+            log.warn("VmFolders tag: vm=${hit.vmId} instance not resolved (${found}) — if the tag was set on the " +
+                     "instance it is still there and still shown in the Morpheus UI")
+        }
+        return ok
+    }
+
+    /**
+     * One reconcile pass over the caller's scoped VMs. Every assignment is written in a
+     * single mutateDb batch; tag removal (consume mode only) happens after it, so a
+     * failed removal can never lose the assignment it was consumed for.
+     *
+     * Returns [mode, assigned, consumed, invalid, skipped, tagged: [vmId: path]].
+     * In off mode it reads no tags and logs nothing.
+     */
+    private Map reconcileTags(ViewModel<Map> model, List servers, boolean allowWrite) {
+        def mode = tagMode()
+        def stats = [mode: mode, assigned: 0, consumed: 0, invalid: 0, skipped: 0, tagged: [:]]
+        if (mode == 'off') return stats
+        // TEMPORARY 1.5.2 diagnostic: proves reconcile was entered and where the mode came from.
+        log.info("VmFolders tag/probe: enter mode=${mode} source=${settingWithSource(TAG_MODE_SETTING, 'off')[1]} servers=${servers?.size()}")
+        if (!allowWrite) {
+            // TEMPORARY 1.5.2 diagnostic (info, not debug): 1.5.1 in keep mode wrote no probe
+            // line at all, so either the mode resolved to off or this branch was taken.
+            def req = model?.request
+            log.info("VmFolders tag/probe: SKIPPED mode=${mode} — ${REQ_HEADER} not seen on /vms " +
+                     "(request=${req?.getClass()?.name} respondsTo(getHeader)=${req?.respondsTo('getHeader') ? true : false})")
+            stats.mode = mode
+            return stats
+        }
+        def instMap = instancesByServerId(model)
+        def hits = []
+        int srvTagged = 0, instTagged = 0
+        servers.each { s ->
+            def h = tagHit(s, instMap)
+            if (!h) return
+            if (h.ownerType == 'instance') instTagged++ else srvTagged++
+            if (!tagReady(s)) { stats.skipped++; return }
+            def path = normPath(h.tag?.value?.toString())
+            if (!path || path == '/') {
+                stats.invalid++
+                log.warn("VmFolders tag: vm=${s.id} (${s.name}) has an unusable ${TAG_NAME} value " +
+                         "[${h.tag?.value}] — VM untouched, tag left in place so it can be corrected")
+                return
+            }
+            h.vmId = s.id?.toString()
+            h.path = path
+            if (h.vmId) hits << h
+        }
+        // TEMPORARY 1.5.0 probe — answers the open items in SPEC-1.5.0: whether
+        // computeServer.list() hydrates `metadata`, and whether a provisioning tag lands
+        // on the server or the instance. Strip once both are confirmed on the appliance.
+        log.info("VmFolders tag/probe: mode=${mode} servers=${servers.size()} serverTagged=${srvTagged} " +
+                 "instanceTagged=${instTagged} instancesMapped=${instMap.size()} usable=${hits.size()} " +
+                 "invalid=${stats.invalid} notReady=${stats.skipped}")
+        if (!hits) return stats
+        def assignedDetail = []
+        mutateDb { Map db ->
+            def asgn = db.assignments as Map ?: [:]
+            def folders = db.folders as List ?: []
+            boolean changed = false
+            hits.each { h ->
+                if (asgn[h.vmId] == h.path) return
+                asgn[h.vmId] = h.path
+                if (!folders.find { (it instanceof Map) && it.path == h.path }) {
+                    folders << [path: h.path, desc: '', created: new Date().toString(), originChecked: true]
+                }
+                // The history ring holds 100 entries; a first pass over a Terraform-tagged
+                // estate must not flush it, so the detail is capped and the rest summarized.
+                if (stats.assigned < 25) addHistory(db, 'assign_from_tag', [vmId: h.vmId, path: h.path, mode: mode])
+                assignedDetail << "vm=${h.vmId} -> ${h.path} (from ${h.ownerType})"
+                stats.assigned++
+                changed = true
+            }
+            if (stats.assigned > 25) addHistory(db, 'assign_from_tag_bulk', [count: stats.assigned, mode: mode])
+            if (changed) { db.assignments = asgn; db.folders = folders }
+            return changed
+        }
+        assignedDetail.take(100).each { log.info("VmFolders tag assigned: ${it}") }
+        if (assignedDetail.size() > 100) log.info("VmFolders tag assigned: ... and ${assignedDetail.size() - 100} more")
+        if (mode == 'consume') {
+            hits.each { h -> if (removeTag(model, h, instMap)) stats.consumed++ }
+        } else {
+            // keep mode: the tag stays the source of truth, so the dashboard shows the
+            // badge and warns that a Move will be reverted on the next reconcile.
+            hits.each { h -> stats.tagged[h.vmId] = h.path }
+        }
+        return stats
+    }
+
     // ── Page ──────────────────────────────────────────────────────────
     def index(ViewModel<Map> model) {
         def nonce = ''
@@ -309,12 +811,8 @@ class VmFoldersController implements PluginController {
     /** Scanning is off unless an admin turned it on. Fail closed on any error. */
     private boolean scanEnabled() {
         try {
-            def raw = morpheusContext.getSettings(plugin)?.blockingGet()
-            if (raw) {
-                def parsed = new JsonSlurper().parseText(raw as String)
-                def v = (parsed instanceof Map) ? parsed[SCAN_SETTING] : null
-                if (v?.toString()?.equalsIgnoreCase('true') || v == true) return true
-            }
+            def v = pluginSettings()[SCAN_SETTING]
+            if (v?.toString()?.equalsIgnoreCase('true') || v == true) return true
         } catch(ex) { log.debug("VmFolders: plugin settings unreadable (${ex.message}); falling back to the local flag") }
         // Fallback for appliances where the plugin settings form is unavailable: a flag
         // in the plugin's own database, writable only through the permission-gated
@@ -374,8 +872,12 @@ class VmFoldersController implements PluginController {
         }
     }
 
-    /** GET /scanConfig — is scanning enabled, and which datastores can be scanned. */
-    def scanConfig(ViewModel<Map> model) {
+    /**
+     * GET /config — everything the dashboard needs before it renders: the root labels,
+     * the tag mode and where each came from, and the scan state with the datastores that
+     * can be scanned. Read-only; replaces 1.4.x's /scanConfig.
+     */
+    def config(ViewModel<Map> model) {
         try {
             if (!model?.user?.account) return reject(model, 401, 'no authenticated user')
             def enabled = scanEnabled()
@@ -383,10 +885,59 @@ class VmFoldersController implements PluginController {
                 [ id: d.id, name: d.name, path: d.externalPath?.toString(),
                   type: d.datastoreType?.code?.toString(), shared: isSharedStore(d) ]
             } : []
-            return JsonResponse.of([success: true, enabled: enabled, datastores: stores])
+            def mode = settingWithSource(TAG_MODE_SETTING, 'off')
+            return JsonResponse.of([
+                success         : true,
+                version         : VERSION,
+                enabled         : enabled,
+                datastores      : stores,
+                tagMode         : tagMode(),
+                tagModeSource   : mode[1],
+                tagName         : TAG_NAME,
+                labelAll        : labelAll(),
+                labelUnorganized: labelUnorg(),
+                labelSource     : [ all: settingWithSource(LABEL_ALL_SETTING, LABEL_ALL_DEFAULT)[1],
+                                    unorganized: settingWithSource(LABEL_UNORG_SETTING, LABEL_UNORG_DEFAULT)[1] ]
+            ])
         } catch(e) {
-            log.error("scanConfig error: ${e.message}", e)
-            return JsonResponse.of([success: false, error: e.message, enabled: false, datastores: []])
+            log.error("config error: ${e.message}", e)
+            return JsonResponse.of([success: false, error: e.message, enabled: false, datastores: [],
+                                    tagMode: 'off', labelAll: LABEL_ALL_DEFAULT, labelUnorganized: LABEL_UNORG_DEFAULT])
+        }
+    }
+
+    /**
+     * POST /setConfig — writes one allow-listed setting to the plugin database.
+     * tagMode is validated against TAG_MODES; the labels are sanitized display strings.
+     * The plugin settings form still wins when it holds a value, and the response says so.
+     */
+    def setConfig(ViewModel<Map> model) {
+        try {
+            def denied = requireMutation(model); if (denied) return denied
+            def key = model?.request?.getParameter('key')?.toString()
+            def val = model?.request?.getParameter('value')?.toString() ?: ''
+            if (!([TAG_MODE_SETTING, LABEL_ALL_SETTING, LABEL_UNORG_SETTING].contains(key))) {
+                return reject(model, 400, 'unknown setting')
+            }
+            String stored
+            if (key == TAG_MODE_SETTING) {
+                stored = val.trim().toLowerCase()
+                if (!TAG_MODES.contains(stored)) return reject(model, 400, "tagMode must be one of ${TAG_MODES.join(', ')}")
+            } else {
+                stored = sanitizeLabel(val, key == LABEL_ALL_SETTING ? LABEL_ALL_DEFAULT : LABEL_UNORG_DEFAULT)
+            }
+            mutateDb { Map db ->
+                def settings = db.settings instanceof Map ? db.settings : [:]
+                settings[key] = stored
+                db.settings = settings
+                return true
+            }
+            def source = settingWithSource(key, stored)[1]
+            log.info("VmFolders config: ${key} set to [${stored}] by user=${model?.user?.username} (effective source=${source})")
+            return JsonResponse.of([success: true, key: key, value: stored, effectiveSource: source])
+        } catch(e) {
+            log.error("setConfig error: ${e.message}", e)
+            return JsonResponse.of([success: false, error: e.message])
         }
     }
 
@@ -628,32 +1179,6 @@ class VmFoldersController implements PluginController {
                 def hit = (full ? volIndex[full] : null) ?: (base ? volIndex[base] : null)
                 if (hit) { vol.volumeId = hit.volumeId; vol.serverId = hit.serverId }
             }
-
-            // TEMPORARY 1.4.1 diagnostic — remove once orphan matching is confirmed.
-            // Logs what is still unmatched next to the identifier forms actually stored
-            // for volumes on this datastore, so a remaining mismatch names itself.
-            def unmatched = out.volumes.findAll { !it.volumeId }
-            if (unmatched) {
-                log.info("VmFolders scan/match: ${unmatched.size()} unmatched volume file(s) on ${out.datastoreName ?: out.path}: " +
-                         unmatched.take(20).collect { it.uuid }.join(', '))
-                int logged = 0
-                servers.each { s ->
-                    if (logged >= 40) return
-                    try {
-                        (s.volumes ?: []).each { v ->
-                            if (logged >= 40) return
-                            def dsName = null
-                            try { def d = v.datastore; dsName = (d instanceof String ? d : d?.name)?.toString() } catch(ig) {}
-                            if (out.datastoreName && dsName && dsName != out.datastoreName) return
-                            logged++
-                            log.info("VmFolders scan/match: server=${s.name} volumeId=${v.id} datastore=${dsName} " +
-                                     "volumePath=[${v.volumePath}] uuid=[${v.uuid}] externalId=[${v.externalId}] " +
-                                     "internalId=[${v.internalId}] uniqueId=[${v.uniqueId}] name=[${v.name}] " +
-                                     "deviceDisplayName=[${v.deviceDisplayName}]")
-                        }
-                    } catch(ex) {}
-                }
-            }
         } catch(ex) { log.warn("VmFolders scan: annotate failed: ${ex.message}") }
     }
 
@@ -661,12 +1186,18 @@ class VmFoldersController implements PluginController {
     def vms(ViewModel<Map> model) {
         try {
             if (!model?.user?.account) return reject(model, 401, 'no authenticated user')
-            def db = readDb()
-            def assignments = db.assignments as Map ?: [:]
 
             def servers = morpheusContext.services.computeServer.list(
                 userQuery(model).withFilter(new DataFilter('vmHypervisor', false))
             ).toList().findAll { canAccess(model, it) }
+
+            // 1.5.0: reconcile vmfolder tags against the scoped list, then migrate any
+            // folder that still has no origin. Both are no-ops unless there is something
+            // to do, and reconcile does nothing at all in the default off mode.
+            def tagStats = reconcileTags(model, servers, vmfXhr(model))
+            def db = mutateDb { Map d -> stampOrigins(d, servers) }
+            def assignments = db.assignments as Map ?: [:]
+            def tagged = tagStats.tagged as Map ?: [:]
 
             def result = servers.collect { s ->
                 def ps = s.powerState
@@ -676,9 +1207,9 @@ class VmFoldersController implements PluginController {
                     def osRaw = (s.osType instanceof String ? s.osType : s.osType?.name) ?: (s.serverOs instanceof String ? s.serverOs : s.serverOs?.name) ?: ''
                     osType = (osRaw.contains('@') || osRaw.contains('com.morpheus')) ? '' : osRaw
                 } catch(ex) {}
-                def cloudName = ''
-                try { cloudName = (s.cloud instanceof String ? s.cloud : s.cloud?.name) ?: '' } catch(ex) {}
+                def cloudName = cloudNameOf(s)
                 def disks = diskList(s)
+                def idStr = s.id?.toString()
 
                 [
                     id         : s.id,
@@ -698,10 +1229,22 @@ class VmFoldersController implements PluginController {
                     disks      : disks,
                     datastores : disks*.datastore.findAll { it }.unique().sort(),
                     unmanaged  : isUnmanaged(s),
-                    isHost     : isHypervisorHost(s)
+                    isHost     : isHypervisorHost(s),
+                    // keep mode only: in consume mode the tag is gone before this renders.
+                    tagged     : tagged.containsKey(idStr),
+                    tagPath    : tagged[idStr] ?: ''
                 ]
             }
-            return JsonResponse.of([servers: result, meta: [total: result.size(), unmanaged: result.count { it.unmanaged }]])
+            return JsonResponse.of([
+                servers: result,
+                meta: [
+                    total    : result.size(),
+                    unmanaged: result.count { it.unmanaged },
+                    tags     : [mode: tagStats.mode, assigned: tagStats.assigned, consumed: tagStats.consumed,
+                                invalid: tagStats.invalid, skipped: tagStats.skipped, tagged: tagged.size()],
+                    labels   : [all: labelAll(), unorganized: labelUnorg()]
+                ]
+            ])
         } catch(e) {
             log.error("vms error: ${e.message}", e)
             return JsonResponse.of([error: e.message, servers: [], meta: [total: 0]])
@@ -717,15 +1260,18 @@ class VmFoldersController implements PluginController {
     def saveFolder(ViewModel<Map> model) {
         try {
             def denied = requireMutation(model); if (denied) return denied
-            def path = model?.request?.getParameter('path') as String
+            def raw = model?.request?.getParameter('path') as String
             def desc = model?.request?.getParameter('desc') as String ?: ''
-            if (!path) return JsonResponse.of([success: false, error: 'path required'])
-            if (!path.startsWith('/')) path = '/' + path
+            if (!raw) return JsonResponse.of([success: false, error: 'path required'])
+            def path = normPath(raw)
+            if (!path || path == '/') return JsonResponse.of([success: false, error: 'invalid folder path'])
             def fpath = path
             mutateDb { Map db ->
                 def folders = db.folders as List ?: []
                 if (folders.find { it.path == fpath }) return false
-                folders << [path: fpath, desc: desc, created: new Date().toString()]
+                // Created by hand: no origin, and marked examined so the origin migration
+                // never adopts it. Re-sync leaves folders without an origin alone.
+                folders << [path: fpath, desc: desc, created: new Date().toString(), originChecked: true]
                 db.folders = folders
                 addHistory(db, 'create_folder', [path: fpath])
                 return true
@@ -763,13 +1309,17 @@ class VmFoldersController implements PluginController {
     def renFolder(ViewModel<Map> model) {
         try {
             def denied = requireMutation(model); if (denied) return denied
-            def oldPath = model?.request?.getParameter('oldPath') as String
-            def newPath = model?.request?.getParameter('newPath') as String
+            def oldPath = normPath(model?.request?.getParameter('oldPath') as String)
+            def newPath = normPath(model?.request?.getParameter('newPath') as String)
             if (!oldPath || !newPath) return JsonResponse.of([success: false, error: 'oldPath and newPath required'])
-            if (!newPath.startsWith('/')) newPath = '/' + newPath
+            if (oldPath == '/' || newPath == '/') return JsonResponse.of([success: false, error: 'invalid folder path'])
+            if (newPath == oldPath) return JsonResponse.of([success: true, newPath: newPath])
+            if (newPath.startsWith(oldPath + '/')) return JsonResponse.of([success: false, error: 'cannot move a folder inside itself'])
             def np = newPath
             mutateDb { Map db ->
-                // Update folder definitions
+                // Update folder definitions. Only `path` changes, so `origin` survives the
+                // rename — that is what lets a renamed auto-created folder keep receiving
+                // the VMs it was created for instead of being recreated by Re-sync.
                 def folders = db.folders as List ?: []
                 folders.each { f ->
                     if (f.path == oldPath) f.path = np
@@ -811,8 +1361,8 @@ class VmFoldersController implements PluginController {
                 if (!vmId.isLong()) return JsonResponse.of([success: false, error: 'invalid vmId'])
                 if (!scopedServer(model, vmId as Long)) return reject(model, 404, 'server not found')
             }
-            if (!path.startsWith('/')) path = '/' + path
-            def fpath = path
+            def fpath = normPath(path)
+            if (!fpath || fpath == '/') return JsonResponse.of([success: false, error: 'invalid folder path'])
             mutateDb { Map db ->
                 def asgn = db.assignments as Map ?: [:]
                 asgn[vmId] = fpath
@@ -820,13 +1370,13 @@ class VmFoldersController implements PluginController {
                 // Auto-create folder if it doesn't exist
                 def folders = db.folders as List ?: []
                 if (!folders.find { it.path == fpath }) {
-                    folders << [path: fpath, desc: '', created: new Date().toString()]
+                    folders << [path: fpath, desc: '', created: new Date().toString(), originChecked: true]
                     db.folders = folders
                 }
                 addHistory(db, 'assign', [vmId: vmId, path: fpath])
                 return true
             }
-            return JsonResponse.of([success: true])
+            return JsonResponse.of([success: true, path: fpath])
         } catch(e) {
             log.error("assign: ${e.message}", e)
             return JsonResponse.of([success: false, error: e.message])
@@ -1019,6 +1569,9 @@ class VmFoldersController implements PluginController {
     body.dark table.vmft tbody tr.sel  { background: var(--hpe-selected); }
     body.dark #vmf-ds-head, body.dark tr.vmf-disk-row, body.dark tr.vmf-disk-row:hover { background: var(--hpe-bg); }
     body.dark .vmf-badge-un { background:#3A2E1A; color:#E0B870; border-color:#5A4828; }
+    body.dark .vmf-badge-tag { background:#1A3A30; color:#01A982; border-color:#2A5A48; }
+    body.dark .vmf-note { background:#3A2E1A; color:#E0B870; border-color:#5A4828; }
+    body.dark .vmf-fg select { background:var(--hpe-white); color:var(--hpe-text); }
     body.dark .vmf-scan-panel { background: var(--hpe-white); }
     body.dark .vmf-scan-head { background: var(--hpe-bg); }
     body.dark .vmf-scan-warn { background:#3A2E1A; color:#E0B870; border-color:#5A4828; }
@@ -1111,6 +1664,9 @@ class VmFoldersController implements PluginController {
     table.vmf-scan-tbl th { border-bottom:1px solid var(--hpe-border); }
     .vmf-scan-other { margin:0 12px 12px; font-size:12px; }
     .vmf-scan-other summary { cursor:pointer; color:var(--hpe-muted); font-size:11px; text-transform:uppercase; letter-spacing:.05em; font-weight:600; padding:4px 0; }
+    .vmf-badge-tag { display:inline-block; background:#e6f5f1; color:#008567; border:1px solid #b3e0d5; border-radius:3px; padding:0 5px; font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:.03em; vertical-align:middle; }
+    .vmf-fg select { width:100%; padding:7px 10px; border:1px solid var(--hpe-border); border-radius:4px; font-size:13px; color:var(--hpe-text); background:var(--hpe-white); font-family:inherit; }
+    .vmf-note { font-size:12px; line-height:1.5; padding:8px 10px; border-radius:4px; background:#fff3e0; color:#8a5300; border:1px solid #f0c890; margin-bottom:12px; }
     .vmf-badge-un { display:inline-block; background:#fff3e0; color:#8a5300; border:1px solid #f0c890; border-radius:3px; padding:0 5px; font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:.03em; vertical-align:middle; }
     .vmf-tag { display:inline-block; background:#e6f5f1; color:var(--hpe-green-dark); border-radius:3px; padding:1px 7px; font-size:11px; font-weight:500; border:1px solid #b3e0d5; }
     .vmf-act { padding:3px 8px; font-size:11px; border:1px solid var(--hpe-border); border-radius:3px; background:#fff; cursor:pointer; color:var(--hpe-text); text-decoration:none; display:inline-flex; align-items:center; }
@@ -1158,6 +1714,7 @@ class VmFoldersController implements PluginController {
       <button class="vmf-btn vmf-btn-outline vmf-btn-sm" id="vmf-restore-btn" title="Restore from backup">&#9100; Restore</button>
       <a class="vmf-btn vmf-btn-outline vmf-btn-sm" id="vmf-export-btn" href="/plugin/vmFolders/export" target="_blank" title="Export database">&#8595; Export</a>
       <button class="vmf-btn vmf-btn-outline vmf-btn-sm" id="vmf-theme-btn" title="Toggle dark/light mode">&#9681;</button>
+      <button class="vmf-btn vmf-btn-outline vmf-btn-sm" id="vmf-settings-btn" title="Plugin settings">&#9881; Settings</button>
       <button class="vmf-btn vmf-btn-outline vmf-btn-sm" id="vmf-logs-btn" title="View plugin logs">&#128196; Logs</button>
       <button class="vmf-btn vmf-btn-outline vmf-btn-sm" id="vmf-refresh-btn">&#8635; Refresh</button>
       <button class="vmf-btn vmf-btn-primary vmf-btn-sm" id="vmf-new-folder-btn">+ Folder</button>
@@ -1205,6 +1762,7 @@ class VmFoldersController implements PluginController {
         localStorage.setItem('vmf-theme', isDark ? 'dark' : 'light');
         this.textContent = isDark ? '\u2600' : '\u263D';
       });
+      document.getElementById('vmf-settings-btn').addEventListener('click', function() { vmfSettings(); });
       document.getElementById('vmf-logs-btn').addEventListener('click', function() { vmfShowLogs(); });
       document.getElementById('vmf-refresh-btn').addEventListener('click', function() { vmfReload(); });
       document.getElementById('vmf-new-folder-btn').addEventListener('click', function() { vmfCreateFolder(); });
@@ -1275,36 +1833,130 @@ class VmFoldersController implements PluginController {
         }
     }
 
+    /** The caller's scoped guest VMs (hypervisor hosts excluded). */
+    private List scopedVmList(ViewModel<Map> model) {
+        return morpheusContext.services.computeServer.list(
+            userQuery(model).withFilter(new DataFilter('vmHypervisor', false))
+        ).toList().findAll { canAccess(model, it) }
+    }
+
     // ── API: resync host assignments for auto-migrated VMs ────────────
+    /**
+     * Follows VME live-migration: a VM in the auto-organized tree moves to the folder for
+     * the host it is on now.
+     *
+     * 1.5.0 resolves the target by ORIGIN, not by name. A folder renamed from
+     * /managed-democracy to /Lab keeps its origin, so it stays the target and its VMs stay
+     * in it — 1.4.x recomputed /<cloud>/<host> from the current names and dragged every VM
+     * back into a recreated tree.
+     *
+     * Also runs one tag reconcile pass, and places a VM that is in no folder into its
+     * cloud/host folder when that folder ALREADY exists — it never invents structure for
+     * an unassigned VM. A folder with no origin was made by hand and is never touched.
+     */
     def resync(ViewModel<Map> model) {
         try {
             def denied = requireMutation(model); if (denied) return denied
-            // Compute expected paths outside the lock (platform calls), apply inside it.
-            def servers = morpheusContext.services.computeServer.list(
-                userQuery(model).withFilter(new DataFilter('vmHypervisor', false))
-            ).toList().findAll { canAccess(model, it) }
-            def expected = [:]
+            // Platform calls outside the lock, db changes inside it.
+            def servers = scopedVmList(model)
+            def tagStats = reconcileTags(model, servers, true)
+            def pairs = [:]
             servers.each { s ->
-                def hostName = (s.parentServer?.name instanceof String ? s.parentServer?.name : s.parentServer?.name?.toString()) ?: ''
-                def cloudName = (s.cloud instanceof String ? s.cloud : s.cloud?.name?.toString()) ?: ''
-                if (hostName && cloudName) expected[s.id?.toString()] = '/' + cloudName.replace('/', '-') + '/' + hostName.replace('/', '-')
+                def c = cloudNameOf(s), h = hostNameOf(s)
+                if (c && h) pairs[s.id?.toString()] = [cloud: c, host: h]
             }
-            def moved = 0
+            def taggedIds = ((tagStats.tagged as Map) ?: [:]).keySet()
+            int moved = 0, placed = 0
+            def detail = []
             mutateDb { Map db ->
-                def assignments = db.assignments as Map ?: [:]
-                expected.each { vid, expectedPath ->
-                    def currentPath = assignments[vid]
-                    if (!currentPath || currentPath == '/') return
-                    // Only update if this looks like an auto-organized path (cloud/host)
-                    if (currentPath.split('/').findAll { it }.size() < 2) return
-                    if (currentPath != expectedPath) { assignments[vid] = expectedPath; moved++ }
+                boolean changed = stampOrigins(db, servers)
+                def asgn = db.assignments as Map ?: [:]
+                pairs.each { vid, p ->
+                    if (!vid) return
+                    // In keep mode the tag is the source of truth, so a tagged VM is left
+                    // where the tag put it — moving it here would only be undone on the
+                    // next reconcile.
+                    if (taggedIds.contains(vid)) return
+                    def folders = db.folders as List ?: []
+                    def current = asgn[vid]?.toString()
+                    if (!current || current == '/') {
+                        def existing = originTarget(db, p.cloud, p.host, false)
+                        if (existing) {
+                            asgn[vid] = existing; placed++; changed = true
+                            detail << "placed vm=${vid} -> ${existing}"
+                        }
+                        return
+                    }
+                    def cf = folders.find { (it instanceof Map) && it.path == current }
+                    // Hand-made folder (examined, no origin): never touched.
+                    if (cf != null && cf.originChecked == true && cf.origin == null) return
+                    // Otherwise the VM is in the auto tree if its folder carries an origin
+                    // or the path is a cloud/host shape — the 1.x rule, kept.
+                    boolean auto = (cf?.origin instanceof Map) || current.split('/').findAll { it }.size() >= 2
+                    if (!auto) return
+                    def target = originTarget(db, p.cloud, p.host, true)
+                    if (target && target != current) {
+                        asgn[vid] = target; moved++; changed = true
+                        detail << "moved vm=${vid} ${current} -> ${target}"
+                    }
                 }
-                if (moved > 0) { db.assignments = assignments; return true }
-                return false
+                if (moved > 0 || placed > 0) {
+                    db.assignments = asgn
+                    // One entry per call: the 100-entry history ring must survive a first
+                    // run over a large estate. Per-VM detail goes to the appliance log.
+                    addHistory(db, 'resync', [moved: moved, placed: placed, user: model?.user?.username?.toString()])
+                }
+                return changed
             }
-            return JsonResponse.of([success:true, moved:moved, message:"Re-synced ${moved} VM(s)"])
+            def msg = "Re-synced ${moved} VM(s)" + (placed > 0 ? ", placed ${placed}" : '')
+            log.info("VmFolders resync: user=${model?.user?.username} moved=${moved} placed=${placed} " +
+                     "tagMode=${tagStats.mode} tagAssigned=${tagStats.assigned} tagConsumed=${tagStats.consumed} tagInvalid=${tagStats.invalid}")
+            detail.take(100).each { log.info("VmFolders resync: ${it}") }
+            if (detail.size() > 100) log.info("VmFolders resync: ... and ${detail.size() - 100} more")
+            return JsonResponse.of([success:true, moved:moved, placed:placed, tags:tagStats.subMap(['mode','assigned','consumed','invalid','skipped']), message:msg])
         } catch(e) {
             log.error("resync error: ${e.message}", e)
+            return JsonResponse.of([success:false, error:e.message])
+        }
+    }
+
+    // ── API: auto-organize into the cloud/host tree ───────────────────
+    /**
+     * Builds the cloud/host tree and assigns every scoped VM, resolving each target by
+     * origin so a renamed folder is reused instead of recreated. Replaces the client-side
+     * loop of 1.4.x, which recomputed paths from names (defeating renames) and issued one
+     * request per folder and per VM.
+     */
+    def autoOrganize(ViewModel<Map> model) {
+        try {
+            def denied = requireMutation(model); if (denied) return denied
+            def servers = scopedVmList(model)
+            def pairs = [:]
+            servers.each { s ->
+                def vid = s.id?.toString()
+                if (!vid) return
+                pairs[vid] = [cloud: cloudNameOf(s) ?: 'Unknown', host: hostNameOf(s) ?: 'Unknown Host']
+            }
+            int assigned = 0, createdFolders = 0
+            mutateDb { Map db ->
+                boolean changed = stampOrigins(db, servers)
+                def asgn = db.assignments as Map ?: [:]
+                int before = ((db.folders as List) ?: []).size()
+                pairs.each { vid, p ->
+                    def target = originTarget(db, p.cloud, p.host, true)
+                    if (!target) return
+                    if (asgn[vid] != target) { asgn[vid] = target; assigned++; changed = true }
+                }
+                createdFolders = (((db.folders as List) ?: []).size()) - before
+                if (assigned > 0) db.assignments = asgn
+                if (changed || createdFolders > 0) addHistory(db, 'auto_organize', [assigned: assigned, folders: createdFolders])
+                return changed || createdFolders > 0
+            }
+            log.info("VmFolders autoOrganize: user=${model?.user?.username} vms=${pairs.size()} assigned=${assigned} foldersCreated=${createdFolders}")
+            return JsonResponse.of([success:true, assigned:assigned, folders:createdFolders,
+                                    message:"Organized ${assigned} VM(s) into ${createdFolders} new folder(s)"])
+        } catch(e) {
+            log.error("autoOrganize error: ${e.message}", e)
             return JsonResponse.of([success:false, error:e.message])
         }
     }

@@ -22,6 +22,12 @@
   // name -> id, because the sidebar is built from VM data (names) while scanning
   // addresses stores by id.
   var scanEnabled = false, scanStores = [], scanCache = {}, scanBusy = false;
+  // Root labels are settings (display-only, always esc()'d). Defaults match 1.4.x so a
+  // failed config fetch changes nothing on screen.
+  var labels = { all: 'All VMs', unorganized: 'Unorganized' };
+  // vmfolder tag reconciliation (1.5.0): off | keep | consume, plus where the effective
+  // value came from ('plugin' settings form, 'db', or 'default').
+  var tagMode = 'off', tagModeSource = 'default', tagName = 'vmfolder';
 
   // Single reset path for the sidebar selection state so folder and datastore
   // views can never both be active (and so a future SPA-navigation reset has one hook).
@@ -180,8 +186,14 @@
   injectInfrastructureLinks();
 
   // ── API ────────────────────────────────────────────────────────────
+  // X-VMF-Request marks this as the dashboard's own XHR. /vms reconciles vmfolder tags,
+  // which can write, and a cross-origin GET cannot set a custom header without a CORS
+  // preflight — so a plain browser GET of /vms stays strictly read-only (CLAUDE.md rule 6).
   async function get(path) {
-    var r = await fetch(API + path, { credentials: 'same-origin', headers: { Accept: 'application/json' } });
+    var r = await fetch(API + path, {
+      credentials: 'same-origin',
+      headers: { Accept: 'application/json', 'X-VMF-Request': '1' }
+    });
     return r.json();
   }
 
@@ -266,27 +278,54 @@
   // Shared with the HBS tab templates so they use the same token logic.
   window.vmfPost = post;
 
+  // Tag reconciliation stats from the last /vms call, reported by the Re-sync toast.
+  var lastTagStats = null;
+
   async function fetchAll() {
     var results = await Promise.all([get('/vms'), get('/db')]);
     allVms = results[0].servers || [];
+    var meta = results[0].meta || {};
+    lastTagStats = meta.tags || null;
+    // /vms carries the labels too, so the tree is never rendered with a stale one.
+    if (meta.labels) {
+      if (meta.labels.all) labels.all = meta.labels.all;
+      if (meta.labels.unorganized) labels.unorganized = meta.labels.unorganized;
+    }
     var db = results[1];
     storedFolders = db.folders || [];
     assignments = db.assignments || {};
-    await loadScanConfig();
+    await loadConfig();
     return db;
   }
 
-  // Scan config and cached results. Failures here never break the folder view.
-  async function loadScanConfig() {
+  // Labels, tag mode, scan state and cached scan results. Failures here never break the
+  // folder view: every value falls back to its 1.4.x default.
+  async function loadConfig() {
     try {
-      var cfg = await get('/scanConfig');
+      var cfg = await get('/config');
       scanEnabled = cfg.enabled === true;
       scanStores = cfg.datastores || [];
+      tagMode = cfg.tagMode || 'off';
+      tagModeSource = cfg.tagModeSource || 'default';
+      tagName = cfg.tagName || 'vmfolder';
+      if (cfg.labelAll) labels.all = cfg.labelAll;
+      if (cfg.labelUnorganized) labels.unorganized = cfg.labelUnorganized;
       if (scanEnabled) {
         var r = await get('/scans');
         scanCache = r.scans || {};
       } else { scanCache = {}; }
     } catch (e) { scanEnabled = false; scanStores = []; scanCache = {}; }
+  }
+
+  // VMs that carry a vmfolder tag right now. Only ever non-empty in keep mode — in
+  // consume mode the tag is gone before the row is rendered.
+  function taggedVms() { return allVms.filter(function(vm){ return vm.tagged === true; }); }
+  function taggedUnder(path) {
+    if (!path) return [];
+    return taggedVms().filter(function(vm) {
+      var tp = vm.tagPath || '';
+      return tp === path || tp.indexOf(path + '/') === 0;
+    });
   }
 
   function scanStoreByName(name) {
@@ -474,13 +513,16 @@
       activeFolder: activeFolder, activeDatastore: activeDatastore,
       cloudFilter: cloudFilter, contextCloud: window.vmfContextCloud || null, cloudUsed: activeCloudName(),
       hostId: window.vmfHostId || null, readOnly: !!window.vmfReadOnly,
+      tagMode: tagMode, tagModeSource: tagModeSource, tagged: taggedVms().length,
+      labels: { all: labels.all, unorganized: labels.unorganized },
+      lastTagStats: lastTagStats,
       clouds: Array.from(new Set(allVms.map(function(vm){ return vm.cloudName||''; }))).sort()
     };
   };
 
   function renderTree() {
     var paths = allPaths();
-    var html = treeItem('__all__', '&#128196;', 'All VMs', scopedVms().length, 0, null, false);
+    var html = treeItem('__all__', '&#128196;', labels.all, scopedVms().length, 0, null, false);
     html += '<div class="vmf-divider"></div>';
     if (!paths.length) {
       html += '<div style="padding:10px 14px;color:#767676;font-size:12px;line-height:1.6">No folders yet.<br>Click <b>+ Folder</b> to create one.</div>';
@@ -494,7 +536,7 @@
     var unorg = scopedVms().filter(function(vm) { return getVmFolder(vm) === ROOT; }).length;
     if (unorg > 0) {
       html += '<div class="vmf-divider"></div>';
-      html += treeItem(ROOT, '&#128220;', 'Unorganized', unorg, 0, null, false);
+      html += treeItem(ROOT, '&#128220;', labels.unorganized, unorg, 0, null, false);
     }
     var el = document.getElementById('vmf-flist');
     if (el) el.innerHTML = html;
@@ -505,10 +547,16 @@
     var cls = 'vmf-fi' + (active ? ' active' : '');
     var style = indent ? ' style="padding-left:' + (14 + indent) + 'px"' : '';
     var title = fullPath ? ' title="' + esc(fullPath) + '"' : '';
-    var actions = (!window.vmfReadOnly && stored) ? '<div class="vmf-fi-actions">' +
-      '<button class="vmf-fi-btn" data-rename="' + esc(key) + '" title="Rename">&#9998;</button>' +
-      '<button class="vmf-fi-btn del" data-delfolder="' + esc(key) + '" title="Delete">&#10006;</button>' +
-      '</div>' : '';
+    // Rename is offered on every real folder path, including an auto-created top level
+    // with no stored record — renFolder rewrites paths and assignments, not records, and
+    // a renamed auto folder keeps its origin so Re-sync keeps feeding it.
+    var actions = '';
+    if (!window.vmfReadOnly && fullPath) {
+      actions = '<div class="vmf-fi-actions">' +
+        '<button class="vmf-fi-btn" data-rename="' + esc(key) + '" title="Rename">&#9998;</button>' +
+        (stored ? '<button class="vmf-fi-btn del" data-delfolder="' + esc(key) + '" title="Delete">&#10006;</button>' : '') +
+        '</div>';
+    }
     return '<div class="' + cls + '"' + style + ' data-folder-key="' + esc(key) + '"' + title + '>' +
       '<span class="vmf-fi-icon">' + icon + '</span>' +
       '<span class="vmf-fi-name">' + esc(name) + '</span>' +
@@ -658,7 +706,7 @@
       var id=vm.id, fp=getVmFolder(vm), sel=selectedIds.has(id);
       var ip = vm.externalIp||vm.internalIp||'—';
       var folderLabel = fp===ROOT
-        ? '<span style="color:#767676;font-style:italic;font-size:11px">Unorganized</span>'
+        ? '<span style="color:#767676;font-style:italic;font-size:11px">'+esc(labels.unorganized)+'</span>'
         : '<span class="vmf-tag">'+esc(fp.split('/').filter(Boolean).pop()||'/')+' </span>';
       var statusStr = String(vm.powerState||'unknown');
       var isOn = statusStr.toLowerCase().match(/on|running/);
@@ -669,7 +717,8 @@
       html += '<tr class="'+(sel?'sel':'')+'">' +
         '<td><input type="checkbox" class="vmf-cb" data-id="'+id+'"'+(sel?' checked':'')+' ></td>' +
         '<td class="vmft-name">'+chev+'<a href="/infrastructure/servers/'+id+'" target="_blank">'+esc(vm.name||'VM-'+id)+'</a>' +
-        (unmanaged ? ' <span class="vmf-badge-un" title="Discovered on the hypervisor, not provisioned by Morpheus">unmanaged</span>' : '') + '</td>' +
+        (unmanaged ? ' <span class="vmf-badge-un" title="Discovered on the hypervisor, not provisioned by Morpheus">unmanaged</span>' : '') +
+        (vm.tagged ? ' <span class="vmf-badge-tag" title="Carries a '+esc(tagName)+' tag for '+esc(vm.tagPath||'')+'. The tag is the source of truth in keep mode: a Move here is reverted on the next reconcile.">tagged</span>' : '') + '</td>' +
         '<td>'+dot(vm.powerState)+'<span style="vertical-align:middle">'+esc(statusStr)+'</span></td>' +
         '<td>'+esc((function(o){return(!o||o.includes('@')||o.includes('morpheus'))?'—':o;})(vm.osType))+'</td>' +
         '<td>'+fmtMem(vm.maxMemory)+'</td>' +
@@ -717,6 +766,9 @@
         }
       }
       renderCloudBar(); renderTree(); renderDatastores(); renderVms();
+      // The page and both tab templates ship a static "All VMs" breadcrumb; replace it
+      // with the configured label once config has loaded (also covers host/cluster tabs).
+      if (!activeDatastore) setBreadcrumb(activeFolder);
       // renderVms() has already set the status to the rows it listed — do not overwrite
       // it with the unscoped total (that is what showed "21 VMs loaded" against 9 rows).
     } catch(e) {
@@ -725,10 +777,16 @@
     }
   };
 
+  // Breadcrumb text for a folder key, honouring the configured root labels.
+  function bcLabel(key) { return key==='__all__' ? labels.all : key===ROOT ? labels.unorganized : key; }
+  function setBreadcrumb(key) {
+    var bc=document.getElementById('vmf-bc');
+    if(bc) bc.innerHTML='&#128193; <b>'+esc(bcLabel(key))+'</b>';
+  }
+
   window.vmfSelectFolder = function(key) {
     resetSelection(key, null); updateMvBtn(); renderTree(); renderDatastores(); renderVms();
-    var bc=document.getElementById('vmf-bc');
-    if(bc) bc.innerHTML='&#128193; <b>'+esc(key==='__all__'?'All VMs':key===ROOT?'Unorganized':key)+'</b>';
+    setBreadcrumb(key);
   };
 
   // On-disk entries are assigned with the key ds:<datastoreId>:<dirname>; the server
@@ -831,7 +889,7 @@
           '<td>' + esc((v.xmlFiles || []).join(', ') || '—') + '</td>' +
           '<td>' + esc(v.newest || '—') + '</td>' +
           '<td>' + (fp ? '<span class="vmf-tag">' + esc(fp.split('/').filter(Boolean).pop() || '/') + '</span>'
-                       : '<span style="color:#767676;font-style:italic">Unorganized</span>') + '</td>' +
+                       : '<span style="color:#767676;font-style:italic">' + esc(labels.unorganized) + '</span>') + '</td>' +
           (window.vmfReadOnly ? '' :
             '<td><button class="vmf-act vmf-dsmove-btn" data-dskey="' + esc(key) + '">Move</button>' +
             (fp ? '<button class="vmf-act vmf-act-x vmf-dsrm-btn" data-dskey="' + esc(key) + '" title="Remove from folder">&#10006;</button>' : '') + '</td>') +
@@ -906,7 +964,16 @@
   window.vmfMoveSelected = function() {
     if(!selectedIds.size) return;
     var opts = allPaths().map(function(p){return '<option>'+esc(p)+'</option>';}).join('');
+    // In keep mode the tag is the source of truth, so a Move of a tagged VM is undone on
+    // the next reconcile. Say so rather than letting the move silently revert.
+    var taggedSel = taggedVms().filter(function(vm){ return selectedIds.has(vm.id); });
+    var warn = taggedSel.length
+      ? '<div class="vmf-note">'+taggedSel.length+' of the selected VM'+(taggedSel.length!==1?'s':'')+
+        ' carr'+(taggedSel.length!==1?'y':'ies')+' a <b>'+esc(tagName)+'</b> tag. The tag is the source of truth in '+
+        esc(tagMode)+' mode, so this move will be reverted on the next reconcile. Change or remove the tag instead.</div>'
+      : '';
     openModal('Move to Folder', [
+      warn,
       fg('Folder Path','<input id="vmf-fi" list="vmf-fl" placeholder="/Production/Web" value="'+(activeFolder!=='__all__'&&activeFolder!==ROOT?esc(activeFolder):'')+'">'+'<datalist id="vmf-fl">'+opts+'</datalist>',
         'Moving '+selectedIds.size+' VM'+(selectedIds.size!==1?'s':'')+'. Use / for nesting.')
     ],[
@@ -946,7 +1013,22 @@
 
   window.vmfRenameFolder = function(path) {
     var f = storedFolders.find(function(x){return x.path===path;});
+    // An auto-created folder keeps its origin across a rename, so Re-sync keeps using it.
+    var autoNote = (f && f.origin)
+      ? '<div class="vmf-hint" style="margin-bottom:12px">This folder was created automatically from '+
+        esc(f.origin.cloud||'')+(f.origin.host?' / '+esc(f.origin.host):'')+
+        '. It keeps that origin after the rename, so Re-sync will keep placing those VMs here.</div>'
+      : '';
+    // keep mode strands tags that still name the old path: they win on the next reconcile.
+    var stranded = (tagMode === 'keep') ? taggedUnder(path) : [];
+    var tagNote = stranded.length
+      ? '<div class="vmf-note">'+stranded.length+' VM'+(stranded.length!==1?'s':'')+' carr'+(stranded.length!==1?'y':'ies')+
+        ' a <b>'+esc(tagName)+'</b> tag with the old path; in keep mode they will move back on the next reconcile. '+
+        'Update the tag values too.</div>'
+      : '';
     openModal('Rename Folder',[
+      tagNote,
+      autoNote,
       fg('Current Path','<input disabled value="'+esc(path)+'">'),
       fg('New Path','<input id="vmf-rnp" value="'+esc(path)+'">','Sub-folders will be updated automatically.')
     ],[
@@ -966,7 +1048,7 @@
 
   window.vmfDeleteFolder = async function(path) {
     var c=countIn(path);
-    var msg='Delete "'+path+'"?'+(c>0?' '+c+' VM(s) will become Unorganized.':'');
+    var msg='Delete "'+path+'"?'+(c>0?' '+c+' VM(s) will become '+labels.unorganized+'.':'');
     openConfirm('Delete Folder', msg, async function() {
       var d=await post('/delFolder', {path: path});
       if(d.success){ vmfToast('Folder deleted'); await fetchAll(); renderTree(); vmfSelectFolder('__all__'); }
@@ -998,7 +1080,7 @@
       } catch(e){fail++;}
     }
     selectedIds.clear(); updateMvBtn();
-    vmfToast(fail>0?ok+' moved, '+fail+' failed':'Moved '+ok+' VM'+(ok!==1?'s':'')+' to '+(path===ROOT?'Unorganized':path),fail>0);
+    vmfToast(fail>0?ok+' moved, '+fail+' failed':'Moved '+ok+' VM'+(ok!==1?'s':'')+' to '+(path===ROOT?labels.unorganized:path),fail>0);
     await fetchAll(); renderTree(); renderDatastores(); renderVms();
   }
 
@@ -1035,6 +1117,66 @@
     clearTimeout(t._t); t._t=setTimeout(function(){t.style.opacity='0';},3500);
   };
 
+
+  // ── Settings ─────────────────────────────────────────────────────────
+  // Writes through /setConfig (tag mode, root labels) and /scanEnable (datastore
+  // scanning). Both stores are read back by /config, and the plugin settings form in
+  // Admin → Plugins still wins when it holds a value — the dialog says so when it does.
+  window.vmfSettings = function() {
+    var modes = [
+      ['off',     'off — ignore ' + tagName + ' tags (default)'],
+      ['keep',    'keep — assign from the tag and leave it in place (read-only)'],
+      ['consume', 'consume — assign, then REMOVE the ' + tagName + ' tag from the VM']
+    ];
+    var opts = modes.map(function(m) {
+      return '<option value="'+esc(m[0])+'"'+(tagMode===m[0]?' selected':'')+'>'+esc(m[1])+'</option>';
+    }).join('');
+    var override = (tagModeSource === 'plugin')
+      ? '<div class="vmf-note">The plugin settings form in <b>Admin &#8594; Plugins</b> is currently setting the tag mode, '+
+        'and it overrides this dialog. Clear it there to control the mode from here.</div>'
+      : '';
+    openModal('VM Folders Settings', [
+      override,
+      fg('vmfolder tag mode', '<select id="vmf-set-tagmode">'+opts+'</select>',
+         'One-way, tag &#8594; folder: a VM with a <b>'+esc(tagName)+'</b> tag whose value is a folder path is put in that folder. '+
+         'The plugin never writes a '+esc(tagName)+' tag. <b>consume</b> is the only mode that modifies a Morpheus record, '+
+         'and it removes nothing but the '+esc(tagName)+' tag itself.'),
+      fg('Label for all VMs', '<input id="vmf-set-laball" value="'+esc(labels.all)+'" placeholder="All VMs">', 'Display only.'),
+      fg('Label for unorganized VMs', '<input id="vmf-set-labunorg" value="'+esc(labels.unorganized)+'" placeholder="Unorganized">', 'Display only.'),
+      fg('Datastore scanning',
+         '<label style="text-transform:none;font-weight:400;font-size:13px;display:flex;align-items:center;gap:7px">'+
+         '<input type="checkbox" id="vmf-set-scan" style="width:auto"'+(scanEnabled?' checked':'')+'> Enable datastore scanning</label>',
+         'Runs read-only <code>find</code>/<code>head</code> commands on a hypervisor host through the Morpheus agent. Off by default.')
+    ], [
+      {l:'Cancel', fn:vmfCloseModal},
+      {l:'Save', primary:true, fn: async function() {
+        var mode = (document.getElementById('vmf-set-tagmode')||{}).value || 'off';
+        var la   = ((document.getElementById('vmf-set-laball')||{}).value || '').trim();
+        var lu   = ((document.getElementById('vmf-set-labunorg')||{}).value || '').trim();
+        var scan = !!(document.getElementById('vmf-set-scan')||{}).checked;
+        vmfCloseModal();
+        var errs = [];
+        async function put(key, value) {
+          var d = await post('/setConfig', {key: key, value: value});
+          if (!d.success) errs.push(key + ': ' + (d.error || 'failed'));
+          return d;
+        }
+        var modeRes = null;
+        if (mode !== tagMode) modeRes = await put('tagMode', mode);
+        if (la !== labels.all) await put('labelAll', la || 'All VMs');
+        if (lu !== labels.unorganized) await put('labelUnorganized', lu || 'Unorganized');
+        if (scan !== scanEnabled) {
+          var ds = await post('/scanEnable', {enabled: scan ? 'true' : 'false'});
+          if (!ds.success) errs.push('scanEnabled: ' + (ds.error || 'failed'));
+        }
+        if (errs.length) { vmfToast('Settings not saved — ' + errs.join('; '), true); }
+        else if (modeRes && modeRes.effectiveSource === 'plugin' && modeRes.value !== tagMode) {
+          vmfToast('Saved, but the plugin settings form is overriding the tag mode', true);
+        } else { vmfToast('Settings saved'); }
+        await vmfReload();
+      }}
+    ]);
+  };
 
   window.vmfShowLogs = async function() {
     openModal('Plugin Logs', [
@@ -1166,30 +1308,42 @@
   };
 
   // ── Auto-organize: Cloud/Host hierarchy ──────────────────────────────
+  // One server-side call. 1.4.x looped saveFolder + assign per folder and per VM with
+  // paths recomputed from names, which recreated a renamed folder; the server now
+  // resolves each target by origin so a renamed folder is reused.
   window.vmfAutoOrganize = function() {
-    openConfirm('Auto-Organize VMs','Create Cloud/Host folders and assign all VMs. Existing assignments will be updated.',async function(){
-      setStatus('Auto-organizing...');
-      var folders={},assignments={};
-      allVms.forEach(function(vm){
-        var cloud=(vm.cloudName||'Unknown').replace(/[/]/g,'-');
-        var host=(vm.hostName||'Unknown Host').replace(/[/]/g,'-');
-        folders['/'+cloud]=true; folders['/'+cloud+'/'+host]=true;
-        assignments[vm.id]='/'+cloud+'/'+host;
+    openConfirm('Auto-Organize VMs',
+      'Create Cloud/Host folders and assign all VMs. Folders you renamed are reused, not recreated. Existing assignments in the Cloud/Host tree will be updated.',
+      async function(){
+        setStatus('Auto-organizing...');
+        var d = await post('/autoOrganize', {});
+        if (!d.success) { vmfToast('Auto-organize failed: '+(d.error||'unknown'), true); setStatus('Error'); return; }
+        await fetchAll(); renderTree(); renderDatastores(); vmfSelectFolder('__all__');
+        vmfToast('Organized '+d.assigned+' VM'+(d.assigned!==1?'s':'')+(d.folders?', '+d.folders+' new folder'+(d.folders!==1?'s':''):''));
       });
-      for(var fp of Object.keys(folders).sort()) await post('/saveFolder', {path: fp});
-      for(var vid of Object.keys(assignments)) await post('/assign', {vmId: vid, path: assignments[vid]});
-      await fetchAll();renderTree();vmfSelectFolder('__all__');
-      vmfToast('Auto-organized '+allVms.length+' VMs');
-    });
   };
 
   // ── Re-sync host assignments (VME auto-migration) ────────────────────
   window.vmfResyncHosts = async function() {
-    openConfirm('Re-sync Host Assignments','Update VMs in Cloud/Host folders to reflect current host locations.',async function(){
+    var body = 'Update VMs in Cloud/Host folders to reflect current host locations. ' +
+      'Folders you renamed keep receiving their VMs. A VM in no folder is placed into its ' +
+      'Cloud/Host folder only when that folder already exists.' +
+      (tagMode !== 'off' ? ' vmfolder tags are reconciled in ' + tagMode + ' mode.' : '');
+    openConfirm('Re-sync Host Assignments', body, async function(){
       setStatus('Re-syncing...');
       var d=await post('/resync', {});
-      vmfToast(d.success?(d.moved>0?'Re-synced '+d.moved+' VM(s)':'All VMs already current'):'Re-sync failed: '+d.error,!d.success);
-      if(d.success&&d.moved>0){await fetchAll();renderTree();renderVms();}
+      if (!d.success) { vmfToast('Re-sync failed: '+(d.error||'unknown'), true); setStatus('Error'); return; }
+      var parts = [];
+      if (d.moved)  parts.push('moved '+d.moved);
+      if (d.placed) parts.push('placed '+d.placed);
+      var t = d.tags || {};
+      if (t.mode && t.mode !== 'off') {
+        parts.push('assigned from tags: '+(t.assigned||0));
+        parts.push('consumed: '+(t.consumed||0));
+        parts.push('invalid: '+(t.invalid||0));
+      }
+      vmfToast(parts.length ? 'Re-sync — '+parts.join(', ') : 'All VMs already current');
+      await fetchAll(); renderTree(); renderDatastores(); renderVms();
     });
   };
 

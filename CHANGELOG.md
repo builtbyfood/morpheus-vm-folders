@@ -1,8 +1,174 @@
 # Changelog
 
-Released versions: **1.0.0**, **1.1.0**, **1.1.5**, **1.2.0**, **1.3.6**, **1.4.1**.
-Intermediate versions (1.1.1–1.1.4, 1.3.0–1.3.5, 1.3.7–1.3.8, 1.4.0) were internal builds — several were
+Released versions: **1.0.0**, **1.1.0**, **1.1.5**, **1.2.0**, **1.3.6**, **1.4.1**, **1.5.4**.
+Intermediate versions (1.1.1–1.1.4, 1.3.0–1.3.5, 1.3.7–1.3.8, 1.4.0, 1.5.0, 1.5.1, 1.5.2, 1.5.3) were internal builds — several were
 diagnostic-only — and their net effect is folded into the release that followed them.
+
+## [1.5.4] - 2026-09-30
+
+(1.5.3 was built with the first fix below and superseded before upload.)
+
+### Fixed
+- **A tag on the instance only was never seen.** Discovery read the server copy first and
+  fell back to `instance.containers`, which is not hydrated — so once the server copy was
+  gone (as 1.5.2 left instance 32) the VM was never reconciled again. A tagged instance
+  with no hydrated containers is now mapped to its server with one workload query
+  (`instance.id` filter). Only tagged instances pay for it; a failure is logged.
+- **`consume` left the tag visible.** A tag set on an instance (wizard, `instances#update`)
+  is copied onto its server's metadata; the instance is the source and the Morpheus UI
+  shows it. 1.5.0–1.5.2 removed only the server copy, logged `removed=true`, and the tag
+  stayed. Consume now removes the tag from **both** records: the server copy, then the
+  instance, found through its workload (`workload` filtered by `server.id` →
+  `workload.instance` → `instance.get()`), because `instance.list()` does not hydrate
+  `containers` on 9.0.2. The instance tag is removed with the `Instance` overload of
+  `metadataTag.remove`. A VM counts as consumed when the instance tag is gone, or — for a
+  VM with no instance — when the server tag is.
+- The `VmFolders tag consumed:` line now reports each record separately: server id, tags
+  found, result and call used; instance id, how it was found (or why not), result and call
+  used. An unresolved instance also logs a warning saying the tag is still visible.
+
+## [1.5.2] - 2026-09-30
+
+### Fixed
+- **Every Morpheus-provisioned VM was treated as still building** and its `vmfolder` tag
+  ignored. The in-flight status check used substring matches, and `provision` matched
+  `provisioned` — the normal status of a finished VM. It is now an exact list:
+  provisioning, pending, queued, deploying, creating, resizing, removing, deprovisioning.
+
+### Diagnostics (temporary)
+- 1.5.1 in `keep` mode wrote no `VmFolders tag/probe` line at all. Two more lines now say
+  why: `tag/probe: enter mode=… source=…` when reconcile starts, and
+  `tag/probe: SKIPPED …` (info, was debug) when `/vms` arrives without `X-VMF-Request`.
+
+## [1.5.1] - 2026-09-30
+
+1.5.0 plus cleanup; this is the release build (1.5.0 was built but a jar with that version
+already exists, so the cleanup takes a new number).
+
+### Removed
+- The `TEMPORARY 1.4.1` `VmFolders scan/match` diagnostic in `annotateScan()`. It shipped in
+  the published 1.4.1 jar; the matching it was checking is unchanged.
+
+### Docs
+- README: how to set the tag (wizard, UI, API, Terraform), a table of accepted and
+  rejected values, and a nine-step test sequence.
+- CLAUDE.md rule 6 now names reconcile-on-load in `vms()` as the single gated exception to
+  "GET is read-only".
+
+## [1.5.0] - 2026-09-30
+
+Folder assignment at provisioning time, and folder renames that survive Re-sync.
+
+**This release can modify a Morpheus record for the first time.** In `consume` mode, and
+only in `consume` mode, the plugin deletes the `vmfolder` tag from a VM after it has used
+it to file that VM. It deletes nothing else: other tags on the same record are untouched,
+and no other field is written. Tag reconciliation is **off by default** and an
+administrator must choose a mode before any tag is read. `keep` mode is fully read-only
+and is the right choice for Terraform-managed tags, where the tag must stay in place or
+the next `terraform apply` will put it back. Disclose this write surface when reviewing
+the plugin, alongside the host-command surface from 1.4.0.
+
+### Added
+- **`vmfolder` tag → folder.** A VM tagged `vmfolder` = `/prod/web` is filed under
+  `/prod/web`, so the provisioning wizard's Tags step, `PUT /api/instances/:id` and
+  Terraform can all set a folder at create time. These exist on VM Essentials, Advanced
+  and Enterprise; Inputs and option lists are Enterprise-only and are therefore not used.
+  - The tag name is matched case-insensitively. The value is normalized with the same
+    rules as a folder created by hand (see **Changed**). An unusable value is logged and
+    skipped with the VM and the tag both left alone, so it can be seen and corrected.
+  - One tag per VM. If several `vmfolder` tags are present the first is used and a warning
+    is logged.
+  - Direction is one-way. The plugin never writes a `vmfolder` tag, and moving a VM in the
+    dashboard never creates or updates one.
+  - Reconciliation runs on a dashboard load and on Re-sync. All assignments are written in
+    a single database transaction per pass, and tag removal happens after it, so a failed
+    removal can never lose the assignment it was made for.
+  - **`tagMode` setting: `off` (default) | `keep` | `consume`.** In `off` no tag is read
+    and nothing is logged. In `keep` the tag stays and remains the source of truth: a
+    tagged VM shows a `tagged` badge, the Move dialog says the move will be reverted on the
+    next reconcile, and Re-sync leaves tagged VMs alone. `consume` removes the tag once the
+    VM has been filed.
+  - The tag is read from the `ComputeServer` and, when the server carries none, from the
+    `Instance` that owns it, and is removed from whichever record carried it — which of the
+    two a provisioning-time tag lands on is platform behaviour, so both are handled.
+  - A VM whose status says it is still being built is skipped, so a tag is never consumed
+    against a VM that may not finish.
+- **Folder `origin`.** An auto-created folder now records where it came from —
+  `{cloud: 'managed-democracy'}` for a cloud folder, `{cloud: 'managed-democracy',
+  host: 'defender'}` for a host folder. Folders created before 1.5.0 are migrated on the
+  first read by matching their path against the current cloud and host names.
+- **Settings dialog** on the dashboard (⚙ Settings): tag mode, both root labels, and the
+  datastore-scanning switch, which previously had no UI at all and could only be set
+  through the plugin settings form. The plugin settings form still wins when it holds a
+  value, and the dialog says so when it does.
+- **Configurable root labels.** `All VMs` and `Unorganized` are settings (`labelAll`,
+  `labelUnorganized`), display-only and escaped on output. They apply to the tree, the
+  breadcrumb, the VM table and the embedded cluster, host and instance tabs.
+- `GET /config` (read-only) replaces `GET /scanConfig`: it carries the scan state and
+  scannable datastores plus the tag mode, the labels, and which store each value came from.
+  `POST /setConfig` writes one allow-listed setting. `POST /autoOrganize` is new.
+
+### Fixed
+- **Renaming an auto-organized folder no longer undoes itself.** `resync` recomputed
+  `/<cloud>/<host>` from the current names, so renaming `/managed-democracy` to `/Lab` and
+  pressing Re-sync recreated the old tree and dragged every VM back into it. Targets are
+  now resolved by `origin`, so a renamed folder stays the target and keeps receiving its
+  VMs. A folder with no origin was made by hand and Re-sync never touches it — that is now
+  enforced by the record rather than inferred from the path depth.
+- **Auto-Organize recreated renamed folders** for the same reason, and issued one request
+  per folder and per VM from the browser. It is now a single `POST /autoOrganize` that
+  resolves every target by origin.
+- **Rename is now offered on any folder**, including an auto-created cloud folder that has
+  no stored record of its own. Previously the pencil appeared only on folders with a
+  record, which is exactly the set that excluded the top-level folders this release is
+  about. Delete is unchanged.
+
+### Changed
+- **Folder paths are validated.** `saveFolder`, `assign` and `renFolder` now put the path
+  through one normalizer: trim, force a leading slash, collapse duplicate slashes, drop a
+  trailing slash, reject control characters, `.` / `..` segments and a backslash inside a
+  segment, and cap the path at 8 segments, 64 characters per segment and 512 overall.
+  Angle brackets and quotes are deliberately still accepted — a hostile folder name is
+  allowed and is made safe by `esc()` at render time, which is what the verification
+  checklist tests. `renFolder` also refuses to move a folder inside itself.
+- **Re-sync places VMs that are in no folder** into their cloud/host folder when that
+  folder already exists. It never creates a folder for an unassigned VM, and the confirm
+  dialog says what it will do. Its toast now reports moved, placed, and the tag counts.
+- `GET /vms` carries `X-VMF-Request` from the dashboard. Reconciliation can write, and
+  `/vms` is a GET, so it only runs for a request carrying that header — a header a
+  cross-origin GET cannot set without a CORS preflight. A plain browser GET of `/vms`
+  stays strictly read-only, which keeps the "GET is read-only" rule intact.
+- Re-sync and Auto-Organize write one history entry per call rather than one per VM, and
+  tag assignments write at most 25 before summarizing. The history ring holds 100 entries
+  and a first pass over a large estate was able to flush it. Per-VM detail goes to the
+  appliance log.
+- The plugin settings form is read at most once every five seconds. A single request asks
+  for the tag mode and both labels, which was three platform calls. The plugin's own
+  database is still re-read every time, so a change made in the dashboard is immediate.
+
+### Platform facts verified against the plugin-api 1.3.0 jar (2026-09-30)
+- `ComputeServer.metadata` and `Instance.metadata` are `List<MetadataTag>`. `MetadataTag`
+  carries `name` and `value`; `name`, `refType` and `refId` come from
+  `MetadataTagIdentityProjection`. **`ComputeServer.tags` is a separate `String` field and
+  is not the tag list.**
+- `MorpheusMetadataTagService` (`morpheusContext.async.metadataTag`) has
+  `remove(List<MetadataTagIdentityProjection>, ComputeServerIdentityProjection)` and an
+  `Instance` equivalent; the synchronous service only has `remove(List)`. `ComputeServer`
+  is a `ComputeServerIdentityProjection`, so the server can be passed straight in and
+  Groovy selects the overload by runtime type. The ref-aware call is preferred and the
+  plain synchronous remove is the fallback.
+- `Instance.containers` is `Collection<Workload>` and `Workload.getServer()` gives the
+  `ComputeServer`, which is how a server is mapped back to its instance.
+
+### Still to confirm on the appliance
+`gradle shadowJar` passes, which does not prove the controller compiles inside Morpheus.
+After upload, check the log and the `VmFolders tag/probe` line it writes once per
+reconcile (temporary; still present in 1.5.1, strip in the build after it is answered):
+- whether `computeServer.list()` hydrates `metadata` the way it hydrates `volumes`;
+- whether a tag set in the provisioning wizard arrives on the `ComputeServer`, the
+  `Instance`, or both, and whether it is present before provisioning completes;
+- whether the ref-aware `remove` works, that the other tags on the VM survive it, and that
+  the removal shows in the Morpheus UI.
 
 ## [1.4.1] - 2026-09-22
 
