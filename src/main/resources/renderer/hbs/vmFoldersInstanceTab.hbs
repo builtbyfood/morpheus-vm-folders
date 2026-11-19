@@ -1,159 +1,25 @@
-<style nonce="{{nonce}}">
-  #vmf-inst-wrap { padding:20px; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; }
-  #vmf-inst-wrap * { box-sizing:border-box; }
-  .vmf-inst-card { background:#fff; border:1px solid #CCCCCC; border-radius:6px; overflow:hidden; max-width:600px; }
-  .vmf-inst-head { background:#425563; color:#fff; padding:12px 16px; display:flex; align-items:center; gap:8px; }
-  .vmf-inst-head h3 { font-size:14px; font-weight:600; display:flex; align-items:center; gap:6px; margin:0; }
-  .vmf-inst-head h3::before { content:''; display:inline-block; width:3px; height:16px; background:#01A982; border-radius:2px; }
-  .vmf-inst-body { padding:20px; }
-  .vmf-inst-row { display:flex; align-items:center; gap:12px; padding:10px 0; border-bottom:1px solid #f0f0f0; }
-  .vmf-inst-row:last-child { border-bottom:none; }
-  .vmf-inst-label { font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.05em; color:#767676; width:100px; flex-shrink:0; }
-  .vmf-inst-val { font-size:13px; color:#333; flex:1; }
-  .vmf-inst-val.folder { color:#008567; font-weight:500; }
-  .vmf-inst-val.unorg { color:#767676; font-style:italic; }
-  .vmf-inst-actions { display:flex; gap:8px; padding-top:16px; }
-  .vmf-inst-btn { padding:7px 14px; border-radius:4px; font-size:12px; font-weight:500; cursor:pointer; text-decoration:none; display:inline-flex; align-items:center; gap:5px; }
-  .vmf-inst-btn-primary { background:#01A982; border:1px solid #008567; color:#fff; }
-  .vmf-inst-btn-primary:hover { background:#008567; }
-  .vmf-inst-btn-outline { background:#fff; border:1px solid #CCCCCC; color:#333; }
-  .vmf-inst-btn-outline:hover { border-color:#01A982; color:#008567; }
-  .vmf-inst-loading { color:#767676; font-size:13px; display:flex; align-items:center; gap:8px; }
-  .vmf-inst-spinner { width:14px; height:14px; border:2px solid #CCCCCC; border-top-color:#01A982; border-radius:50%; animation:vmfInstSpin .7s linear infinite; }
-  @keyframes vmfInstSpin { to { transform:rotate(360deg); } }
-  .vmf-inst-move-form { display:none; margin-top:12px; padding:12px; background:#F5F5F5; border-radius:4px; border:1px solid #CCCCCC; }
-  .vmf-inst-move-form label { display:block; font-size:11px; font-weight:600; margin-bottom:4px; color:#767676; text-transform:uppercase; }
-  .vmf-inst-move-form input { width:100%; padding:7px 10px; border:1px solid #CCCCCC; border-radius:4px; font-size:13px; margin-bottom:8px; }
-  .vmf-inst-move-form input:focus { outline:none; border-color:#01A982; }
-</style>
-
-<div id="vmf-inst-wrap" data-server-id="{{serverId}}" data-instance-name="{{instanceName}}" data-plugin-url="{{pluginUrl}}">
-  <div class="vmf-inst-card">
-    <div class="vmf-inst-head">
-      <h3>VM Folders</h3>
-      <span style="font-size:11px;color:#B0BEC5;">{{instanceName}}</span>
-      <a href="{{pluginUrl}}" target="_blank"
-         style="margin-left:auto;font-size:11px;color:#B0BEC5;text-decoration:none;border:1px solid rgba(255,255,255,.3);padding:3px 8px;border-radius:3px;">
-        Full View ↗
-      </a>
-    </div>
-    <div class="vmf-inst-body">
-      <div id="vmf-inst-content">
-        <div class="vmf-inst-loading">
-          <div class="vmf-inst-spinner"></div>
-          Loading folder info...
-        </div>
-      </div>
-    </div>
+<!-- VM Folders 1.5.10 — lazy tab shell (instance detail page). Static: no data, no tab CSS, no request to /plugin/vmFolders/ until the tab is opened. vmFolders.js (vmfLazyInit) builds the rest. -->
+<div id="vmf-lazy-instance" data-instance-id="{{instanceId}}" data-instance-name="{{instanceName}}" data-server-id="{{serverId}}" data-asset-version="{{assetVersion}}" data-load-mode="{{loadMode}}">
+  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:8px 12px;font-size:12px;">
+    <span class="vmf-lazy-status">Not loaded</span>
+    <button type="button" class="btn btn-default btn-sm vmf-lazy-load">Load</button>
+    <button type="button" class="btn btn-default btn-sm vmf-lazy-refresh" style="display:none">Refresh</button>
+    <label style="margin:0 0 0 auto;font-weight:400;"><input type="checkbox" class="vmf-lazy-noauto"> Don't auto-load this tab</label>
   </div>
+  <div class="vmf-lazy-body"></div>
 </div>
-
 <script nonce="{{nonce}}">
 (function() {
-  // Read model values from attributes (HTML-escaped by Handlebars) rather than
-  // interpolating them into JS string literals.
-  var wrapEl = document.getElementById('vmf-inst-wrap');
-  var ds = (wrapEl && wrapEl.dataset) || {};
-  var serverId = ds.serverId || '';
-  var instanceName = ds.instanceName || '';
-  var pluginUrl = ds.pluginUrl || '/plugin/vmFolders';
-  // Root labels are a plugin setting (1.5.0). Default matches earlier releases, so a
-  // failed /config fetch changes nothing here.
-  var labelUnorganized = 'Unorganized';
-
-  function render(folder) {
-    var isOrg = folder && folder !== '/';
-    var folderDisplay = isOrg
-      ? '<span class="vmf-inst-val folder">&#128193; ' + esc(folder) + '</span>'
-      : '<span class="vmf-inst-val unorg">' + esc(labelUnorganized) + '</span>';
-
-    var html = '<div class="vmf-inst-row">' +
-      '<span class="vmf-inst-label">Instance</span>' +
-      '<span class="vmf-inst-val">' + esc(instanceName) + '</span></div>' +
-      '<div class="vmf-inst-row">' +
-      '<span class="vmf-inst-label">Server ID</span>' +
-      '<span class="vmf-inst-val">' + esc(serverId || '—') + '</span></div>' +
-      '<div class="vmf-inst-row">' +
-      '<span class="vmf-inst-label">Folder</span>' +
-      folderDisplay + '</div>';
-
-    html += '<div class="vmf-inst-actions">' +
-      '<a href="' + pluginUrl + '" target="_blank" class="vmf-inst-btn vmf-inst-btn-outline">&#128196; Open VM Folders</a>' +
-      '<button class="vmf-inst-btn vmf-inst-btn-outline" onclick="vmfInstToggleMove()">&#128193; ' + (isOrg ? 'Move Folder' : 'Assign Folder') + '</button>' +
-      '</div>';
-
-    html += '<div class="vmf-inst-move-form" id="vmf-inst-mf">' +
-      '<label>Folder Path</label>' +
-      '<input id="vmf-inst-fp" type="text" placeholder="/Production/Web" value="' + (isOrg ? esc(folder) : '') + '">' +
-      '<div style="display:flex;gap:6px;">' +
-      '<button class="vmf-inst-btn vmf-inst-btn-primary" onclick="vmfInstSave()">Save</button>' +
-      '<button class="vmf-inst-btn vmf-inst-btn-outline" onclick="vmfInstToggleMove()">Cancel</button>' +
-      (isOrg ? '<button class="vmf-inst-btn vmf-inst-btn-outline" style="color:#c00;border-color:#c00" onclick="vmfInstRemove()">Remove</button>' : '') +
-      '</div></div>';
-
-    document.getElementById('vmf-inst-content').innerHTML = html;
+  function go() {
+    if (typeof window.vmfLazyInit === 'function') { window.vmfLazyInit('instance'); return; }
+    var st = document.querySelector('#vmf-lazy-instance .vmf-lazy-status');
+    if (st) st.textContent = 'VM Folders script is out of date in this browser - reload with Ctrl+F5.';
   }
-
-  function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
-
-  window.vmfInstToggleMove = function() {
-    var f = document.getElementById('vmf-inst-mf');
-    if (f) f.style.display = f.style.display === 'none' || !f.style.display ? 'block' : 'none';
-  };
-
-  // POST helper. Prefer the shared implementation from vmFolders.js (injected on
-  // every core page by VmFoldersNavProvider); fall back to a local one that
-  // reads core's Spring Security CSRF meta tag, which is always present here
-  // because this tab renders inside the core layout.
-  function vmfPost(path, params) {
-    if (typeof window.vmfPost === 'function') return window.vmfPost(path, params);
-    var body = new URLSearchParams();
-    Object.keys(params).forEach(function(k) { body.append(k, String(params[k])); });
-    var headers = { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8', 'X-VMF-Request': '1' };
-    var meta = document.querySelector('meta[name="_csrf"]');
-    var hdr  = document.querySelector('meta[name="_csrf_header"]');
-    if (meta && meta.content) headers[(hdr && hdr.content) || 'X-XSRF-TOKEN'] = meta.content;
-    return fetch('/plugin/vmFolders' + path, { method: 'POST', credentials: 'same-origin', headers: headers, body: body.toString() })
-      .then(function(r) {
-        if (r.redirected && /invalid-csrf/.test(r.url)) return { success: false, error: 'rejected by server CSRF check (reload the page and retry)' };
-        return r.json();
-      });
-  }
-
-  window.vmfInstSave = async function() {
-    var el = document.getElementById('vmf-inst-fp');
-    if (!el || !serverId) return;
-    var path = el.value.trim();
-    if (!path) return;
-    if (!path.startsWith('/')) path = '/' + path;
-    try {
-      var d = await vmfPost('/assign', {vmId: serverId, path: path});
-      if (d.success) { render(path); } else { alert('Failed: ' + d.error); }
-    } catch(e) { alert('Error: ' + e.message); }
-  };
-
-  window.vmfInstRemove = async function() {
-    if (!serverId) return;
-    if (!confirm('Remove from folder?')) return;
-    try {
-      var d = await vmfPost('/unassign', {vmId: serverId});
-      if (d.success) { render(''); } else { alert('Failed: ' + d.error); }
-    } catch(e) { alert('Error: ' + e.message); }
-  };
-
-  // Load current folder from the DB, and the display labels from /config.
-  Promise.all([
-    fetch('/plugin/vmFolders/db').then(function(r) { return r.json(); }),
-    fetch('/plugin/vmFolders/config').then(function(r) { return r.json(); }).catch(function() { return {}; })
-  ]).then(function(res) {
-    var db = res[0] || {}, cfg = res[1] || {};
-    if (cfg.labelUnorganized) labelUnorganized = cfg.labelUnorganized;
-    var assignments = db.assignments || {};
-    var folder = serverId ? (assignments[serverId] || '') : '';
-    render(folder);
-  }).catch(function(e) {
-    document.getElementById('vmf-inst-content').innerHTML =
-      '<div style="color:#c00;font-size:13px;">Could not load folder data: ' + e.message + '</div>';
-  });
+  if (typeof window.vmfLazyInit === 'function') { go(); return; }
+  var s = document.createElement('script');
+  s.src = '/assets/plugin/vm-folders/vmFolders.js?v={{assetVersion}}';
+  s.nonce = '{{nonce}}';
+  s.onload = go;
+  document.head.appendChild(s);
 })();
 </script>

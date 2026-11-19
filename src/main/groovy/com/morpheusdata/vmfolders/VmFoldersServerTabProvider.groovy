@@ -11,10 +11,16 @@ import com.morpheusdata.views.ViewModel
 import groovy.util.logging.Slf4j
 
 /**
+ * VM Folders 1.5.10
  * Adds a "VM Folders" tab on individual host/server detail pages.
  * Infrastructure → Compute → Hosts → (host name) → VM Folders tab
  *
  * NOTE: renderTemplate takes single ComputeServer param in morpheus-plugin-api:1.3.0
+ *
+ * Lazy tab (1.5.8): Morpheus calls show() and renderTemplate() for every server detail
+ * page on the request thread, whether or not the tab is opened. Both decide only from
+ * the object they are handed plus the cached settings (VmFoldersSettings, 60 s) and make
+ * no service call. The template is a static shell; data loads after the tab is opened.
  */
 @Slf4j
 class VmFoldersServerTabProvider extends AbstractServerTabProvider {
@@ -42,6 +48,7 @@ class VmFoldersServerTabProvider extends AbstractServerTabProvider {
     @Override
     Boolean show(ComputeServer server, User user, Account account) {
         try {
+            if (!VmFoldersSettings.tabEnabled(VmFoldersSettings.cached(morpheusContext, plugin))) return false
             return server?.vmHypervisor == true || server?.serverType?.vmHypervisor == true
         } catch(e) {
             return true
@@ -58,6 +65,8 @@ class VmFoldersServerTabProvider extends AbstractServerTabProvider {
                 serverId  : server?.id ?: 0,
                 serverName: server?.name ?: 'Host',
                 cloudName : cloudName,
+                loadMode  : VmFoldersSettings.loadMode(VmFoldersSettings.cached(morpheusContext, plugin)),
+                assetVersion: VmFoldersController.VERSION,   // cache-buster for vmFolders.js (1.5.9)
                 pluginUrl : '/plugin/vmFolders'
             ]
             return getRenderer().renderTemplate('hbs/vmFoldersServerTab', model)

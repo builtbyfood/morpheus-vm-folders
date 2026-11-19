@@ -29,7 +29,7 @@ class VmFoldersController implements PluginController {
 
     static final String DATA_DIR  = '/var/opt/morpheus/morpheus-ui/plugins'
     static final String DB_FILE   = "${DATA_DIR}/vm-folders.json"
-    static final String VERSION   = '1.5.4'
+    static final String VERSION   = '1.5.10'
     static final String BAK_FILE  = "${DATA_DIR}/vm-folders.json.bak"
 
     VmFoldersController(Plugin plugin, MorpheusContext morpheusContext) {
@@ -49,6 +49,9 @@ class VmFoldersController implements PluginController {
             p("/vmFolders",           "index"),
             p("/vmFolders/index",     "index"),
             p("/vmFolders/vms",       "vms"),
+            // 1.5.10: back on admin-cm like every other route. The 1.5.7 permission probe
+            // (/db on a plugin-declared permission, plus a /permProbe route) is removed;
+            // a real permission split is 1.6.0 work.
             p("/vmFolders/db",        "getDb"),
             p("/vmFolders/saveFolder","saveFolder"),
             p("/vmFolders/delFolder", "delFolder"),
@@ -67,13 +70,15 @@ class VmFoldersController implements PluginController {
             // `scans` is read-only.
             p("/vmFolders/scan",       "scan"),
             p("/vmFolders/scans",      "scans"),
-            p("/vmFolders/scanEnable", "scanEnable"),
-            // 1.5.0. `config` is read-only and replaces `scanConfig` (it carries the
-            // scan keys plus tagMode and the root labels). `setConfig` and
-            // `autoOrganize` are mutations.
+            // 1.5.0. `config` is read-only: it reports the plugin settings form (scan
+            // switch, tag mode, root labels). Since 1.5.5 there is no route that writes a
+            // setting — Admin → Plugins is the only place they are changed.
+            // `autoOrganize` is a mutation.
             p("/vmFolders/config",       "config"),
-            p("/vmFolders/setConfig",    "setConfig"),
-            p("/vmFolders/autoOrganize", "autoOrganize")
+            p("/vmFolders/autoOrganize", "autoOrganize"),
+            // 1.5.8 lazy tabs. Read-only: the server id behind an instance, asked for by
+            // the instance tab after it is opened, and only when the provider had none.
+            p("/vmFolders/instanceServer", "instanceServer")
         ]
     }
 
@@ -197,6 +202,33 @@ class VmFoldersController implements PluginController {
             fos.getFD().sync()      // durable before the rename
         } finally { fos.close() }
         Files.move(tmp.toPath(), f.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+        invalidateVms()     // every folder / assignment change goes through here
+    }
+
+    // ── /vms cache (1.5.8) ────────────────────────────────────────────
+    // The answer to /vms is kept for 30 seconds per user so reopening a tab, or opening
+    // the tab on the next detail page, does not repeat the platform list calls. It is
+    // only served to a request that does not ask for fresh data: the dashboard, every
+    // Refresh and every reload after an action send ?fresh=1. Any write to the plugin
+    // database, a restore and a power action drop it. A change made in Morpheus itself
+    // (a VM created, powered or moved there) can be up to 30 s behind on a tab's first
+    // open; Refresh shows it at once.
+    static final long VMS_TTL_MS = 30000L
+    static final int  VMS_CACHE_MAX = 200
+    private final java.util.concurrent.ConcurrentHashMap<String, Map> vmsCache = new java.util.concurrent.ConcurrentHashMap<String, Map>()
+
+    private void invalidateVms() { vmsCache.clear() }
+
+    /** Per user, and separate for a dashboard XHR (which may reconcile tags) and a plain GET. */
+    private String vmsCacheKey(ViewModel<Map> model) {
+        return "${model?.user?.account?.id}:${model?.user?.id}:${vmfXhr(model)}"
+    }
+
+    private static boolean wantsFresh(ViewModel<Map> model) {
+        try {
+            def v = model?.request?.getParameter('fresh')?.toString()
+            return v != null && v != '' && v != '0' && v != 'false'
+        } catch(ex) { return true }
     }
 
     private void addHistory(Map db, String action, Map details) {
@@ -207,11 +239,11 @@ class VmFoldersController implements PluginController {
     }
 
     // ══ Settings (1.5.0) ═══════════════════════════════════════════════
-    // Two stores, in this order: the plugin's own settings form (Admin → Plugins), then
-    // a key in the plugin database written through the permission-gated setConfig route.
-    // The form wins when it holds a value, so an administrator can always override the
-    // dashboard. Whether the settings form is usable on this platform is still
-    // unverified (see the 1.4.0 notes), which is why the database fallback exists.
+    // The plugin settings form (Administration → Plugins → VM Folders) is the single
+    // source of truth, confirmed working on 9.0.2. There is no second store and no
+    // route that writes a setting (the 1.5.0–1.5.4 dashboard dialog and setConfig /
+    // scanEnable routes are gone). Old `settings` keys left in the plugin database by
+    // those builds are ignored.
     static final String TAG_MODE_SETTING   = 'tagMode'
     static final String LABEL_ALL_SETTING  = 'labelAll'
     static final String LABEL_UNORG_SETTING = 'labelUnorganized'
@@ -221,8 +253,6 @@ class VmFoldersController implements PluginController {
     static final int MAX_LABEL_LEN = 40
 
     // One request reads several settings, so the platform call is memoized briefly.
-    // Only the settings FORM is cached; the plugin database is re-read every time, so a
-    // change made in the dashboard is visible immediately.
     static final long SETTINGS_TTL_MS = 5000L
     private volatile Map settingsCache = null
     private volatile long settingsCacheAt = 0L
@@ -239,31 +269,26 @@ class VmFoldersController implements PluginController {
                 def parsed = new JsonSlurper().parseText(raw as String)
                 if (parsed instanceof Map) out = parsed
             }
-        } catch(ex) { log.debug("VmFolders: plugin settings unreadable (${ex.message}); using the local store") }
+        } catch(ex) { log.warn("VmFolders: plugin settings unreadable (${ex.message}); using defaults") }
         settingsCache = out
         settingsCacheAt = now
         return out
     }
 
-    /** [value, source] where source is 'plugin', 'db' or 'default'. */
-    private List settingWithSource(String key, String dflt) {
+    /** One value from the settings form, or the default when it is unset or blank. */
+    private String setting(String key, String dflt) {
         def v = pluginSettings()[key]
-        if (v != null && !v.toString().trim().isEmpty()) return [v.toString().trim(), 'plugin']
-        try {
-            def local = readDb()?.settings?.get(key)
-            if (local != null && !local.toString().trim().isEmpty()) return [local.toString().trim(), 'db']
-        } catch(ex) {}
-        return [dflt, 'default']
+        return (v != null && !v.toString().trim().isEmpty()) ? v.toString().trim() : dflt
     }
 
     /** off | keep | consume. Anything unrecognised is off — the feature fails closed. */
     private String tagMode() {
-        def m = settingWithSource(TAG_MODE_SETTING, 'off')[0].toLowerCase()
+        def m = setting(TAG_MODE_SETTING, 'off').toLowerCase()
         return TAG_MODES.contains(m) ? m : 'off'
     }
 
-    private String labelAll()   { sanitizeLabel(settingWithSource(LABEL_ALL_SETTING,  LABEL_ALL_DEFAULT)[0],  LABEL_ALL_DEFAULT) }
-    private String labelUnorg() { sanitizeLabel(settingWithSource(LABEL_UNORG_SETTING, LABEL_UNORG_DEFAULT)[0], LABEL_UNORG_DEFAULT) }
+    private String labelAll()   { sanitizeLabel(setting(LABEL_ALL_SETTING,  LABEL_ALL_DEFAULT),  LABEL_ALL_DEFAULT) }
+    private String labelUnorg() { sanitizeLabel(setting(LABEL_UNORG_SETTING, LABEL_UNORG_DEFAULT), LABEL_UNORG_DEFAULT) }
 
     /** Display-only label: control chars out, length capped. esc() still applies on output. */
     private static String sanitizeLabel(String raw, String dflt) {
@@ -318,7 +343,7 @@ class VmFoldersController implements PluginController {
     }
 
     // On VME-managed VMs these arrive as a String on some records and an object on
-    // others — both shapes have to be handled (see CLAUDE.md).
+    // others — both shapes have to be handled (see the project notes).
     private static String cloudNameOf(def s) {
         try { return ((s.cloud instanceof String) ? s.cloud : s.cloud?.name)?.toString() ?: '' } catch(ex) { return '' }
     }
@@ -422,33 +447,49 @@ class VmFoldersController implements PluginController {
     //    ComputeServer IS a ComputeServerIdentityProjection, so the server can be passed
     //    straight in and Groovy picks the overload by runtime type.
     //
-    // NOT verifiable without the appliance, hence the probe log line in reconcileTags():
-    //  - whether computeServer.list() hydrates `metadata` (as it does `volumes`),
-    //  - whether a provisioning-time tag lands on the ComputeServer, the Instance or
-    //    both — so both are read, and the tag is removed from whichever carried it.
+    // Verified on 9.0.2 (1.5.4):
+    //  - a tag set in the wizard (Configure → Advanced Options → Tags) or through
+    //    instances#update lives on the Instance and is copied onto its server's
+    //    metadata. The instance is the source the UI shows.
+    //  - computeServer.list() hydrates `metadata`.
+    //  - Mapping a server to its instance: 1.5.4 resolved it (vm=48, 49) and 1.5.5, which
+    //    kept only the instance.containers scan, did not (vm=50). 1.5.4's map was filled
+    //    by the containers scan AND by a workload lookup for tagged instances the scan
+    //    missed, under one label — so the workload path is the one evidenced to work and
+    //    containers hydration is unproven. All three paths are kept, each labelled.
     static final String TAG_NAME = 'vmfolder'
+    /** Both spellings are accepted on read (case-insensitive); TAG_NAME is the documented one. */
+    static final List<String> TAG_NAMES = ['vmfolder', 'vmfolders']
 
     /** Reconcile only runs for a request that came from the dashboard's own XHR.
      *  It can write (consume mode removes a tag), and /vms is a GET, so the custom
-     *  header a cross-origin GET cannot set is what keeps CLAUDE.md rule 6 honest:
+     *  header a cross-origin GET cannot set is what keeps the read-only-GET rule honest:
      *  a plain browser GET of /vms stays strictly read-only. */
     private boolean vmfXhr(ViewModel<Map> model) {
         try { return header(model?.request, REQ_HEADER) != null } catch(ex) { return false }
     }
 
-    /** The vmfolder tags on one record. Case-insensitive on the tag name. */
+    /** The vmfolder / vmfolders tags on one record. Case-insensitive on the tag name. */
     private static List tagsOn(def owner) {
         def hits = []
         try {
             (owner?.metadata ?: []).each { t ->
                 def n = t?.name?.toString()?.trim()
-                if (n && n.equalsIgnoreCase(TAG_NAME)) hits << t
+                if (n && TAG_NAMES.contains(n.toLowerCase())) hits << t
             }
         } catch(ex) {}
         return hits
     }
 
-    /** server id -> Instance, so a tag the platform put on the instance is still found. */
+    /**
+     * server id -> [instance, how-it-was-mapped], so a tag the platform put on the
+     * instance is found and removed at the source.
+     *
+     * 1. instance.containers → workload.server (free when hydrated).
+     * 2. For a tagged instance the scan did not map: one workload query filtered by
+     *    instance.id → workload.server. This is the 1.5.4 path that resolved vm=48/49;
+     *    1.5.5 dropped it and vm=50 went unresolved. Only tagged instances pay for it.
+     */
     private Map instancesByServerId(ViewModel<Map> model) {
         def map = [:]
         try {
@@ -461,20 +502,19 @@ class VmFoldersController implements PluginController {
                 try {
                     (inst.containers ?: []).each { w ->
                         def sid = w?.server?.id
-                        if (sid != null && !map.containsKey(sid)) { map[sid] = inst; mapped = true }
+                        if (sid != null && !map.containsKey(sid)) { map[sid] = [inst, 'instance.containers']; mapped = true }
                     }
                 } catch(ex) {}
-                // containers is not hydrated by instance.list() on 9.0.2, so a tagged
-                // instance is mapped from the workload side instead. Only tagged instances
-                // pay for the query. This is what finds a tag that is on the instance only —
-                // e.g. after 1.5.2 removed the server copy and left the instance tag.
-                // [V] whether instance.list() hydrates metadata, and the 'instance.id' filter.
                 if (!mapped && tagsOn(inst)) {
                     try {
                         def w = morpheusContext.services.workload.find(new DataQuery().withFilter('instance.id', inst.id))
                         def sid = w?.server?.id
-                        if (sid != null && w.instance?.id in [null, inst.id] && !map.containsKey(sid)) map[sid] = inst
-                        else log.info("VmFolders tag/probe: tagged instance#${inst.id} not mapped (workload=${w?.id} server=${sid} instance=${w?.instance?.id})")
+                        if (sid != null && w.instance?.id in [null, inst.id] && !map.containsKey(sid)) {
+                            map[sid] = [inst, "workload(instance.id)#${w.id}"]
+                        } else {
+                            log.warn("VmFolders tag: tagged instance#${inst.id} not mapped to a server " +
+                                     "(workload=${w?.id} server=${sid} instance=${w?.instance?.id})")
+                        }
                     } catch(ex) {
                         log.warn("VmFolders tag: workload lookup for instance#${inst.id} failed (${ex.class.name}: ${ex.message})")
                     }
@@ -484,17 +524,57 @@ class VmFoldersController implements PluginController {
         return map
     }
 
-    /** The tag to act on for this VM, server record first, then its instance. */
-    private Map tagHit(def s, Map instByServerId) {
-        def hits = tagsOn(s)
-        def ownerType = 'server'
-        def owner = s
-        if (!hits) {
-            def inst = instByServerId?.get(s.id)
-            if (inst) {
-                def ih = tagsOn(inst)
-                if (ih) { hits = ih; ownerType = 'instance'; owner = inst }
+    /**
+     * The instance that owns this server: [instance, how-it-was-found], or [null, why].
+     * The map from instancesByServerId() first; failing that, one workload query filtered
+     * by server.id → workload.instance → instance.get(). The server has already passed
+     * canAccess(); the instance is checked again before anything is removed from it.
+     */
+    private List instanceForServer(ViewModel<Map> model, def s, Map instByServerId) {
+        def m = instByServerId?.get(s?.id)
+        if (m) return m
+        try {
+            def w = morpheusContext.services.workload.find(new DataQuery().withFilter('server.id', s.id))
+            if (!w) return [null, "no workload with server.id=${s.id}"]
+            if (w.server?.id != null && w.server.id != s.id) return [null, "workload#${w.id} belongs to server#${w.server.id}"]
+            def ref = w.instance
+            if (ref?.id == null) return [null, "workload#${w.id} has no instance"]
+            def inst = morpheusContext.services.instance.get(ref.id as Long) ?: ref
+            if (!canAccess(model, inst)) return [null, "instance#${ref.id} not accessible to caller"]
+            return [inst, "workload(server.id)#${w.id}"]
+        } catch(ex) {
+            return [null, "workload lookup failed (${ex.class.simpleName}: ${ex.message})"]
+        }
+    }
+
+    /** vmfolder tags on an instance: its metadata, else a metadataTag query by ref
+     *  (refType 'Instance'), for an instance record loaded without its metadata. */
+    private List instanceTags(def inst) {
+        def hits = tagsOn(inst)
+        if (hits) return [hits, 'instance.metadata']
+        try {
+            def q = new DataQuery().withFilter('refType', 'Instance').withFilter('refId', inst.id as Long)
+            hits = (morpheusContext.services.metadataTag.list(q) ?: []).findAll { t ->
+                def n = t?.name?.toString()?.trim()
+                n && TAG_NAMES.contains(n.toLowerCase())
             }
+            return [hits, 'metadataTag.list(refType=Instance)']
+        } catch(ex) {
+            return [[], "metadataTag query failed (${ex.class.simpleName}: ${ex.message})"]
+        }
+    }
+
+    /** The tag to act on for this VM: its instance (the source) first, then the server's
+     *  copy — which is all a VM with no instance, e.g. a discovered VM, can carry. */
+    private Map tagHit(def s, Map instByServerId) {
+        def inst = instByServerId?.get(s.id)?.getAt(0)
+        def hits = inst ? tagsOn(inst) : []
+        def ownerType = 'instance'
+        def owner = inst
+        if (!hits) {
+            hits = tagsOn(s)
+            ownerType = 'server'
+            owner = s
         }
         if (!hits) return null
         if (hits.size() > 1) {
@@ -522,100 +602,63 @@ class VmFoldersController implements PluginController {
         } catch(ex) { return true }
     }
 
-    /**
-     * The Instance that owns this server, or null. Returns [instance, how-it-was-found].
-     *
-     * Instance.containers is NOT hydrated by instance.list() on 9.0.2 (1.5.2 probe:
-     * instancesMapped=0), so the link is resolved from the workload side: one workload
-     * query filtered by server.id, then workload.instance, then instance.get() for a
-     * fully loaded record. The server has already passed canAccess(); the instance is
-     * checked again before anything is removed from it.
-     * [V] Whether the 'server.id' filter path is honoured and workload.instance is
-     * populated is unverified — the consumed log line reports how the instance was
-     * found, or why it was not.
-     */
-    private List instanceForServer(ViewModel<Map> model, def s, Map instByServerId) {
-        def inst = instByServerId?.get(s.id)
-        if (inst) return [inst, 'instance.containers']
-        try {
-            def w = morpheusContext.services.workload.find(new DataQuery().withFilter('server.id', s.id))
-            if (!w) return [null, "no workload with server.id=${s.id}"]
-            if (w.server?.id != null && w.server.id != s.id) return [null, "workload#${w.id} belongs to server#${w.server.id} (filter ignored?)"]
-            def ref = w.instance
-            if (ref?.id == null) return [null, "workload#${w.id} has no instance"]
-            inst = morpheusContext.services.instance.get(ref.id as Long) ?: ref
-            if (!canAccess(model, inst)) return [null, "instance#${ref.id} not accessible to caller"]
-            return [inst, "workload#${w.id}.instance"]
-        } catch(ex) {
-            return [null, "workload lookup failed (${ex.class.simpleName}: ${ex.message})"]
-        }
-    }
-
-    /** vmfolder tags on an instance: its metadata, else a metadataTag query by ref.
-     *  [V] refType 'Instance' is the Morpheus convention but unverified on 9.0.2. */
-    private List instanceTags(def inst) {
-        def hits = tagsOn(inst)
-        if (hits) return [hits, 'instance.metadata']
-        try {
-            def q = new DataQuery().withFilter('refType', 'Instance').withFilter('refId', inst.id as Long)
-            hits = (morpheusContext.services.metadataTag.list(q) ?: []).findAll { t ->
-                t?.name?.toString()?.trim()?.equalsIgnoreCase(TAG_NAME)
-            }
-            return [hits, 'metadataTag.list(refType=Instance)']
-        } catch(ex) {
-            return [[], "metadataTag query failed (${ex.class.simpleName}: ${ex.message})"]
-        }
-    }
-
-    /** Removes the given tags from one owning record. Returns [removed, via]. */
+    /** Removes the given tags from one owning record. Returns [removed, via, error]. */
     private List removeFrom(List tags, def ref) {
         def kind = ref?.getClass()?.simpleName
+        def err = null
         try {
             def r = morpheusContext.async.metadataTag.remove(tags, ref)?.blockingGet()
-            if (r == true) return [true, "async.remove(tags, ${kind})"]
-            log.warn("VmFolders tag: async.remove(tags, ${kind}#${ref?.id}) returned ${r}; trying the plain remove")
+            if (r == true) return [true, "async.remove(tags, ${kind})", null]
+            err = "async.remove returned ${r}"
         } catch(ex) {
-            log.warn("VmFolders tag: async.remove(tags, ${kind}#${ref?.id}) failed (${ex.class.name}: ${ex.message}); trying the plain remove")
+            err = "async.remove: ${ex.class.simpleName}: ${ex.message}"
         }
         try {
-            return [morpheusContext.services.metadataTag.remove(tags) == true, 'services.remove(tags)']
+            if (morpheusContext.services.metadataTag.remove(tags) == true) return [true, 'services.remove(tags)', err]
+            return [false, 'services.remove(tags)', err + '; plain remove returned false']
         } catch(ex) {
-            log.error("VmFolders tag: removal FAILED on ${kind}#${ref?.id}: ${ex.class.name}: ${ex.message}", ex)
-            return [false, "failed: ${ex.class.simpleName}"]
+            return [false, 'none', "${err}; plain remove: ${ex.class.simpleName}: ${ex.message}"]
         }
     }
 
     /**
-     * Removes the vmfolder tag from the VM: the server's copy and the instance's tag.
+     * Removes the vmfolder tag from the VM: the instance's tag first, then the server copy.
      *
      * THIS IS THE ONLY PLACE THE PLUGIN WRITES TO A MORPHEUS RECORD, and it runs only in
      * consume mode. It deletes nothing but the vmfolder tag itself: other tags on either
-     * record are untouched. Every removal is audit-logged with the user, the VM, the path
-     * and the result on each record.
+     * record are untouched.
      *
-     * On 9.0.2 a tag set on an instance (wizard, instances#update) is copied to its
-     * server's metadata, and the instance is the source the UI shows. Removing only the
-     * server copy (1.5.0–1.5.2) returned removed=true and left the tag visible, so the
-     * instance is resolved through its workload and its tag removed too. Success means
-     * the instance tag is gone, or — for a VM with no instance — the server tag is.
+     * The instance is the source the Morpheus UI shows; the server carries a copy.
+     * Removing only the server copy (1.5.0–1.5.3) reported success and left the tag
+     * visible. A VM counts as consumed when the instance tag is gone, or — when there was
+     * no instance tag to remove — when the server tag is (a warning says if no instance
+     * was resolved at all).
+     * One audit line per VM, naming both records and how the instance was found.
      */
     private boolean removeTag(ViewModel<Map> model, Map hit, Map instByServerId) {
         def s = hit.server
-        def srvTags = tagsOn(s)
-        def srv = srvTags ? removeFrom(srvTags, s) : [null, 'no tag on server']
+        // Resolve the instance BEFORE anything is removed, while the server copy of the tag
+        // is still present, then remove the instance tag (the source), then the copy.
         def (inst, found) = instanceForServer(model, s, instByServerId)
-        def ins = [null, 'no instance']
+        def ins = [null, 'no instance', null]
+        def src = '-'
         if (inst) {
-            def (instTags, src) = instanceTags(inst)
-            ins = instTags ? removeFrom(instTags, inst) + [src] : [null, "no ${TAG_NAME} tag on instance (${src})"]
+            def (instTags, how) = instanceTags(inst)
+            src = how
+            ins = instTags ? removeFrom(instTags, inst) : [null, 'no tag on instance', null]
         }
+        def srvTags = tagsOn(s)
+        def srv = srvTags ? removeFrom(srvTags, s) : [null, 'no tag on server', null]
         boolean ok = (ins[0] == true) || (ins[0] == null && srv[0] == true)
-        log.info("VmFolders tag consumed: user=${model?.user?.username} vm=${hit.vmId} path=${hit.path} ok=${ok} | " +
-                 "server#${s?.id} tags=${srvTags.size()} removed=${srv[0]} via=${srv[1]} | " +
-                 "instance#${inst?.id ?: '-'} found=${found} removed=${ins[0]} via=${ins.drop(1).join(' / ')}")
+        log.info("VmFolders tag consumed: user=${model?.user?.username} vm=${hit.vmId} path=${hit.path} ok=${ok} " +
+                 "instance#${inst?.id ?: '-'} found=${found} tags=${src} removed=${ins[0]} (${ins[1]}) " +
+                 "server#${s?.id} removed=${srv[0]} (${srv[1]})")
+        [['instance', inst?.id, ins], ['server', s?.id, srv]].each { kind, id, res ->
+            if (res[2]) log.warn("VmFolders tag: ${kind}#${id} removal for vm=${hit.vmId}: ${res[2]}")
+        }
         if (!inst) {
-            log.warn("VmFolders tag: vm=${hit.vmId} instance not resolved (${found}) — if the tag was set on the " +
-                     "instance it is still there and still shown in the Morpheus UI")
+            log.warn("VmFolders tag: vm=${hit.vmId} instance not resolved (${found}) — a tag set on the " +
+                     "instance is still there and still shown in the Morpheus UI")
         }
         return ok
     }
@@ -632,24 +675,16 @@ class VmFoldersController implements PluginController {
         def mode = tagMode()
         def stats = [mode: mode, assigned: 0, consumed: 0, invalid: 0, skipped: 0, tagged: [:]]
         if (mode == 'off') return stats
-        // TEMPORARY 1.5.2 diagnostic: proves reconcile was entered and where the mode came from.
-        log.info("VmFolders tag/probe: enter mode=${mode} source=${settingWithSource(TAG_MODE_SETTING, 'off')[1]} servers=${servers?.size()}")
         if (!allowWrite) {
-            // TEMPORARY 1.5.2 diagnostic (info, not debug): 1.5.1 in keep mode wrote no probe
-            // line at all, so either the mode resolved to off or this branch was taken.
-            def req = model?.request
-            log.info("VmFolders tag/probe: SKIPPED mode=${mode} — ${REQ_HEADER} not seen on /vms " +
-                     "(request=${req?.getClass()?.name} respondsTo(getHeader)=${req?.respondsTo('getHeader') ? true : false})")
+            log.debug("VmFolders tag: reconcile skipped — request is not a dashboard XHR")
             stats.mode = mode
             return stats
         }
         def instMap = instancesByServerId(model)
         def hits = []
-        int srvTagged = 0, instTagged = 0
         servers.each { s ->
             def h = tagHit(s, instMap)
             if (!h) return
-            if (h.ownerType == 'instance') instTagged++ else srvTagged++
             if (!tagReady(s)) { stats.skipped++; return }
             def path = normPath(h.tag?.value?.toString())
             if (!path || path == '/') {
@@ -662,12 +697,6 @@ class VmFoldersController implements PluginController {
             h.path = path
             if (h.vmId) hits << h
         }
-        // TEMPORARY 1.5.0 probe — answers the open items in SPEC-1.5.0: whether
-        // computeServer.list() hydrates `metadata`, and whether a provisioning tag lands
-        // on the server or the instance. Strip once both are confirmed on the appliance.
-        log.info("VmFolders tag/probe: mode=${mode} servers=${servers.size()} serverTagged=${srvTagged} " +
-                 "instanceTagged=${instTagged} instancesMapped=${instMap.size()} usable=${hits.size()} " +
-                 "invalid=${stats.invalid} notReady=${stats.skipped}")
         if (!hits) return stats
         def assignedDetail = []
         mutateDb { Map db ->
@@ -808,16 +837,15 @@ class VmFoldersController implements PluginController {
     static final java.util.regex.Pattern SCAN_PATH_OK = ~/^(\/mnt\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\/var\/morpheus\/kvm\/[a-z0-9-]+)$/
     static final List<String> SHARED_TYPES = ['libvirt-netfs-nfs', 'libvirt-dir-gfs2']
 
-    /** Scanning is off unless an admin turned it on. Fail closed on any error. */
+    /** Scanning is off unless an admin ticked it in the plugin settings form.
+     *  The checkbox stores 'on' (or 'true'); anything else, or any error, is off. */
     private boolean scanEnabled() {
         try {
             def v = pluginSettings()[SCAN_SETTING]
-            if (v?.toString()?.equalsIgnoreCase('true') || v == true) return true
-        } catch(ex) { log.debug("VmFolders: plugin settings unreadable (${ex.message}); falling back to the local flag") }
-        // Fallback for appliances where the plugin settings form is unavailable: a flag
-        // in the plugin's own database, writable only through the permission-gated
-        // scanEnable route. Both default to off.
-        try { return readDb()?.settings?.get(SCAN_SETTING) == true } catch(ex) { return false }
+            if (v == true) return true
+            def str = v?.toString()?.trim()?.toLowerCase()
+            return str == 'on' || str == 'true'
+        } catch(ex) { return false }
     }
 
     /** Datastores the caller may see, minus Morpheus-internal and offline stores. */
@@ -885,78 +913,27 @@ class VmFoldersController implements PluginController {
                 [ id: d.id, name: d.name, path: d.externalPath?.toString(),
                   type: d.datastoreType?.code?.toString(), shared: isSharedStore(d) ]
             } : []
-            def mode = settingWithSource(TAG_MODE_SETTING, 'off')
             return JsonResponse.of([
                 success         : true,
                 version         : VERSION,
                 enabled         : enabled,
                 datastores      : stores,
                 tagMode         : tagMode(),
-                tagModeSource   : mode[1],
                 tagName         : TAG_NAME,
+                tagNames        : TAG_NAMES,
                 labelAll        : labelAll(),
                 labelUnorganized: labelUnorg(),
-                labelSource     : [ all: settingWithSource(LABEL_ALL_SETTING, LABEL_ALL_DEFAULT)[1],
-                                    unorganized: settingWithSource(LABEL_UNORG_SETTING, LABEL_UNORG_DEFAULT)[1] ]
+                // 1.5.8 lazy tabs: what the tab providers will act on (they read the same
+                // form through a 60 s cache). tabEnabledRaw is the stored value exactly as
+                // the platform returns it, so the checkbox's on/off spelling can be checked.
+                tabEnabled      : VmFoldersSettings.tabEnabled(pluginSettings()),
+                tabEnabledRaw   : pluginSettings()[VmFoldersSettings.TAB_ENABLED_KEY]?.toString(),
+                tabLoadMode     : VmFoldersSettings.loadMode(pluginSettings())
             ])
         } catch(e) {
             log.error("config error: ${e.message}", e)
             return JsonResponse.of([success: false, error: e.message, enabled: false, datastores: [],
                                     tagMode: 'off', labelAll: LABEL_ALL_DEFAULT, labelUnorganized: LABEL_UNORG_DEFAULT])
-        }
-    }
-
-    /**
-     * POST /setConfig — writes one allow-listed setting to the plugin database.
-     * tagMode is validated against TAG_MODES; the labels are sanitized display strings.
-     * The plugin settings form still wins when it holds a value, and the response says so.
-     */
-    def setConfig(ViewModel<Map> model) {
-        try {
-            def denied = requireMutation(model); if (denied) return denied
-            def key = model?.request?.getParameter('key')?.toString()
-            def val = model?.request?.getParameter('value')?.toString() ?: ''
-            if (!([TAG_MODE_SETTING, LABEL_ALL_SETTING, LABEL_UNORG_SETTING].contains(key))) {
-                return reject(model, 400, 'unknown setting')
-            }
-            String stored
-            if (key == TAG_MODE_SETTING) {
-                stored = val.trim().toLowerCase()
-                if (!TAG_MODES.contains(stored)) return reject(model, 400, "tagMode must be one of ${TAG_MODES.join(', ')}")
-            } else {
-                stored = sanitizeLabel(val, key == LABEL_ALL_SETTING ? LABEL_ALL_DEFAULT : LABEL_UNORG_DEFAULT)
-            }
-            mutateDb { Map db ->
-                def settings = db.settings instanceof Map ? db.settings : [:]
-                settings[key] = stored
-                db.settings = settings
-                return true
-            }
-            def source = settingWithSource(key, stored)[1]
-            log.info("VmFolders config: ${key} set to [${stored}] by user=${model?.user?.username} (effective source=${source})")
-            return JsonResponse.of([success: true, key: key, value: stored, effectiveSource: source])
-        } catch(e) {
-            log.error("setConfig error: ${e.message}", e)
-            return JsonResponse.of([success: false, error: e.message])
-        }
-    }
-
-    /** POST /scanEnable — admin switch for appliances without the plugin settings form. */
-    def scanEnable(ViewModel<Map> model) {
-        try {
-            def denied = requireMutation(model); if (denied) return denied
-            def on = model?.request?.getParameter('enabled')?.toString() == 'true'
-            mutateDb { Map db ->
-                def settings = db.settings instanceof Map ? db.settings : [:]
-                settings[SCAN_SETTING] = on
-                db.settings = settings
-                return true
-            }
-            log.info("VmFolders scan: scanning ${on ? 'ENABLED' : 'disabled'} by user=${model?.user?.username}")
-            return JsonResponse.of([success: true, enabled: on])
-        } catch(e) {
-            log.error("scanEnable error: ${e.message}", e)
-            return JsonResponse.of([success: false, error: e.message])
         }
     }
 
@@ -1187,15 +1164,33 @@ class VmFoldersController implements PluginController {
         try {
             if (!model?.user?.account) return reject(model, 401, 'no authenticated user')
 
+            // 1.5.8: a request that did not ask for fresh data may be answered from the
+            // 30 s per-user cache (see vmsCache). Tag reconcile is skipped with it — it
+            // ran when the cached answer was built and runs again on the next fresh call.
+            long t0 = System.currentTimeMillis()
+            String cacheKey = vmsCacheKey(model)
+            if (!wantsFresh(model)) {
+                def hit = vmsCache.get(cacheKey)
+                if (hit != null && (t0 - (hit.at as long)) < VMS_TTL_MS) {
+                    def payload = hit.payload as Map
+                    def meta = new LinkedHashMap(payload.meta as Map)
+                    meta.timing = [cached: true, ageMs: t0 - (hit.at as long), totalMs: System.currentTimeMillis() - t0]
+                    return JsonResponse.of([servers: payload.servers, meta: meta])
+                }
+            }
+
             def servers = morpheusContext.services.computeServer.list(
                 userQuery(model).withFilter(new DataFilter('vmHypervisor', false))
             ).toList().findAll { canAccess(model, it) }
+            long tList = System.currentTimeMillis()
 
             // 1.5.0: reconcile vmfolder tags against the scoped list, then migrate any
             // folder that still has no origin. Both are no-ops unless there is something
             // to do, and reconcile does nothing at all in the default off mode.
             def tagStats = reconcileTags(model, servers, vmfXhr(model))
+            long tTags = System.currentTimeMillis()
             def db = mutateDb { Map d -> stampOrigins(d, servers) }
+            long tDb = System.currentTimeMillis()
             def assignments = db.assignments as Map ?: [:]
             def tagged = tagStats.tagged as Map ?: [:]
 
@@ -1235,19 +1230,71 @@ class VmFoldersController implements PluginController {
                     tagPath    : tagged[idStr] ?: ''
                 ]
             }
-            return JsonResponse.of([
-                servers: result,
-                meta: [
-                    total    : result.size(),
-                    unmanaged: result.count { it.unmanaged },
-                    tags     : [mode: tagStats.mode, assigned: tagStats.assigned, consumed: tagStats.consumed,
-                                invalid: tagStats.invalid, skipped: tagStats.skipped, tagged: tagged.size()],
-                    labels   : [all: labelAll(), unorganized: labelUnorg()]
-                ]
-            ])
+            long tEnd = System.currentTimeMillis()
+            // Where the time went, phase by phase: list = computeServer.list + tenant
+            // filter; tags = tag reconcile (instance.list, only when tagMode is not off and
+            // the request is a dashboard XHR); db = plugin database read/migrate;
+            // build = shaping the rows. Returned in meta.timing and logged — at info when
+            // the call took 500 ms or more, so a slow appliance shows up without debug on.
+            def timing = [cached: false, listMs: tList - t0, tagsMs: tTags - tList, dbMs: tDb - tTags,
+                          buildMs: tEnd - tDb, totalMs: tEnd - t0]
+            def line = "VmFolders vms: total=${timing.totalMs}ms list=${timing.listMs}ms tags=${timing.tagsMs}ms " +
+                       "db=${timing.dbMs}ms build=${timing.buildMs}ms servers=${result.size()} tagMode=${tagStats.mode}"
+            if (timing.totalMs >= 500L) log.info(line) else log.debug(line)
+            def metaOut = [
+                total    : result.size(),
+                unmanaged: result.count { it.unmanaged },
+                tags     : [mode: tagStats.mode, assigned: tagStats.assigned, consumed: tagStats.consumed,
+                            invalid: tagStats.invalid, skipped: tagStats.skipped, tagged: tagged.size()],
+                labels   : [all: labelAll(), unorganized: labelUnorg()]
+            ]
+            if (vmsCache.size() >= VMS_CACHE_MAX) vmsCache.clear()
+            // The cached copy reports no tag activity: that happened once, on this call.
+            def cachedMeta = new LinkedHashMap(metaOut)
+            cachedMeta.tags = [mode: tagStats.mode, assigned: 0, consumed: 0, invalid: tagStats.invalid,
+                               skipped: tagStats.skipped, tagged: tagged.size()]
+            vmsCache.put(cacheKey, [at: tEnd, payload: [servers: result, meta: cachedMeta]])
+            metaOut.timing = timing
+            return JsonResponse.of([servers: result, meta: metaOut])
         } catch(e) {
             log.error("vms error: ${e.message}", e)
             return JsonResponse.of([error: e.message, servers: [], meta: [total: 0]])
+        }
+    }
+
+    // ── API: server behind an instance (1.5.8 lazy tabs) ──────────────
+    /**
+     * GET /instanceServer?instanceId=N — the id of the VM behind an instance, for the
+     * instance tab. Read-only. Up to 1.5.7 the tab provider resolved this while Morpheus
+     * was building the instance page; it is now asked for only after the tab is opened,
+     * and only when the Instance handed to the provider carried no workload.
+     * Same lookups the tag code relies on: instance.containers, then a workload query by
+     * instance.id (the path evidenced on 9.0.2).
+     */
+    def instanceServer(ViewModel<Map> model) {
+        try {
+            if (!model?.user?.account) return reject(model, 401, 'no authenticated user')
+            def raw = model?.request?.getParameter('instanceId')?.toString()
+            if (!raw?.isLong()) return reject(model, 400, 'instanceId required')
+            def inst = morpheusContext.services.instance.get(raw as Long)
+            if (!inst || !canAccess(model, inst)) return reject(model, 404, 'instance not found')
+            def sid = null
+            def found = 'none'
+            try {
+                def first = inst.containers?.find { it?.server?.id != null }
+                if (first) { sid = first.server.id; found = 'instance.containers' }
+            } catch(ex) {}
+            if (sid == null) {
+                def w = morpheusContext.services.workload.find(new DataQuery().withFilter('instance.id', inst.id))
+                if (w?.server?.id != null && w.instance?.id in [null, inst.id]) {
+                    sid = w.server.id
+                    found = "workload(instance.id)#${w.id}".toString()
+                }
+            }
+            return JsonResponse.of([success: true, instanceId: inst.id, serverId: sid?.toString() ?: '', found: found])
+        } catch(e) {
+            log.error("instanceServer error: ${e.message}", e)
+            return JsonResponse.of([success: false, error: e.message, serverId: ''])
         }
     }
 
@@ -1447,6 +1494,7 @@ class VmFoldersController implements PluginController {
                 if (!(parsed instanceof Map)) return JsonResponse.of([success: false, error: 'Backup is not a valid database'])
                 Files.copy(bak.toPath(), Paths.get(DB_FILE), StandardCopyOption.REPLACE_EXISTING)
             }
+            invalidateVms()
             return JsonResponse.of([success: true, message: 'Restored from backup'])
         } catch(e) {
             return JsonResponse.of([success: false, error: e.message])
@@ -1472,7 +1520,6 @@ class VmFoldersController implements PluginController {
             return JsonResponse.of([error: e.message])
         }
     }
-
 
     // ── API: log collection ───────────────────────────────────────────
     def logs(ViewModel<Map> model) {
@@ -1519,6 +1566,7 @@ class VmFoldersController implements PluginController {
                 case 'restart': result = morpheusContext.services.computeServer.restartServer(vmId); break
                 default: return JsonResponse.of([success: false, error: "Unknown action: ${action}"])
             }
+            invalidateVms()
             return JsonResponse.of([success: result != null ? true : false, action: action, vmId: vmId])
         } catch(e) {
             log.error("power: ${e.message}", e)
@@ -1714,7 +1762,7 @@ class VmFoldersController implements PluginController {
       <button class="vmf-btn vmf-btn-outline vmf-btn-sm" id="vmf-restore-btn" title="Restore from backup">&#9100; Restore</button>
       <a class="vmf-btn vmf-btn-outline vmf-btn-sm" id="vmf-export-btn" href="/plugin/vmFolders/export" target="_blank" title="Export database">&#8595; Export</a>
       <button class="vmf-btn vmf-btn-outline vmf-btn-sm" id="vmf-theme-btn" title="Toggle dark/light mode">&#9681;</button>
-      <button class="vmf-btn vmf-btn-outline vmf-btn-sm" id="vmf-settings-btn" title="Plugin settings">&#9881; Settings</button>
+      <button class="vmf-btn vmf-btn-outline vmf-btn-sm" id="vmf-settings-btn" title="Current settings (change them in Administration → Plugins)">&#9881; Settings</button>
       <button class="vmf-btn vmf-btn-outline vmf-btn-sm" id="vmf-logs-btn" title="View plugin logs">&#128196; Logs</button>
       <button class="vmf-btn vmf-btn-outline vmf-btn-sm" id="vmf-refresh-btn">&#8635; Refresh</button>
       <button class="vmf-btn vmf-btn-primary vmf-btn-sm" id="vmf-new-folder-btn">+ Folder</button>
@@ -1823,6 +1871,7 @@ class VmFoldersController implements PluginController {
             switch(action) {
                 case 'restart':
                     def result = morpheusContext.services.computeServer.restartServer(vmId)
+                    invalidateVms()
                     return JsonResponse.of([success:result, action:action])
                 default:
                     return JsonResponse.of([success:false, error:"Action '${action}' not implemented via plugin. Use Morpheus UI for workflows/tasks."])

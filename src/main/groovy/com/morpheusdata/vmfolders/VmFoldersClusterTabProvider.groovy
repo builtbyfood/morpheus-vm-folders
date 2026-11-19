@@ -11,7 +11,11 @@ import com.morpheusdata.views.ViewModel
 import groovy.util.logging.Slf4j
 
 /**
+ * VM Folders 1.5.10
  * Adds a "VM Folders" tab on cluster detail pages.
+ * Lazy tab (1.5.8): show() and renderTemplate() make no service call — see
+ * VmFoldersServerTabProvider. The template is a static shell.
+ *
  * Infrastructure → Clouds → (cluster name) → VM Folders tab
  *
  * NOTE: AbstractClusterTabProvider uses ComputeServerGroup, not ComputeServer.
@@ -42,7 +46,11 @@ class VmFoldersClusterTabProvider extends AbstractClusterTabProvider {
 
     @Override
     Boolean show(ComputeServerGroup server, User user, Account account) {
-        return true
+        try {
+            return VmFoldersSettings.tabEnabled(VmFoldersSettings.cached(morpheusContext, plugin))
+        } catch(e) {
+            return true
+        }
     }
 
     @Override
@@ -65,6 +73,8 @@ class VmFoldersClusterTabProvider extends AbstractClusterTabProvider {
                 serverId  : server?.id ?: 0,
                 serverName: server?.name ?: 'Cluster',
                 cloudName : cloudName,
+                loadMode  : VmFoldersSettings.loadMode(VmFoldersSettings.cached(morpheusContext, plugin)),
+                assetVersion: VmFoldersController.VERSION,   // cache-buster for vmFolders.js (1.5.9)
                 pluginUrl : '/plugin/vmFolders'
             ]
             return getRenderer().renderTemplate('hbs/vmFoldersClusterTab', model)

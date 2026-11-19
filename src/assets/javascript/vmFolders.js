@@ -25,9 +25,8 @@
   // Root labels are settings (display-only, always esc()'d). Defaults match 1.4.x so a
   // failed config fetch changes nothing on screen.
   var labels = { all: 'All VMs', unorganized: 'Unorganized' };
-  // vmfolder tag reconciliation (1.5.0): off | keep | consume, plus where the effective
-  // value came from ('plugin' settings form, 'db', or 'default').
-  var tagMode = 'off', tagModeSource = 'default', tagName = 'vmfolder';
+  // vmfolder tag reconciliation (1.5.0): off | keep | consume, from the plugin settings form.
+  var tagMode = 'off', tagName = 'vmfolder';
 
   // Single reset path for the sidebar selection state so folder and datastore
   // views can never both be active (and so a future SPA-navigation reset has one hook).
@@ -188,13 +187,39 @@
   // ── API ────────────────────────────────────────────────────────────
   // X-VMF-Request marks this as the dashboard's own XHR. /vms reconciles vmfolder tags,
   // which can write, and a cross-origin GET cannot set a custom header without a CORS
-  // preflight — so a plain browser GET of /vms stays strictly read-only (CLAUDE.md rule 6).
-  async function get(path) {
-    var r = await fetch(API + path, {
+  // preflight — so a plain browser GET of /vms stays strictly read-only (the read-only-GET rule).
+  // opts.timeoutMs (1.5.8, lazy tabs only) aborts a request that hangs, so the tab ends
+  // in an error with a Retry button instead of a spinner that never stops.
+  async function get(path, opts) {
+    var init = {
       credentials: 'same-origin',
       headers: { Accept: 'application/json', 'X-VMF-Request': '1' }
-    });
-    return r.json();
+    };
+    var ms = opts && opts.timeoutMs, timer = null;
+    if (ms && typeof AbortController === 'function') {
+      var ac = new AbortController();
+      init.signal = ac.signal;
+      timer = setTimeout(function() { ac.abort(); }, ms);
+    }
+    try {
+      var r = await fetch(API + path, init);
+      return await r.json();
+    } catch (e) {
+      if (e && e.name === 'AbortError') throw new Error('no answer from ' + path.split('?')[0] + ' after ' + Math.round(ms / 1000) + ' s');
+      throw e;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  // /config for the embedded tabs is kept for the browser session (1.5.8). The standalone
+  // dashboard and every Refresh still fetch it, and rewrite this copy when they do.
+  var CFG_KEY = 'vmFolders.config';
+  function cfgRead() {
+    try { var s = sessionStorage.getItem(CFG_KEY); return s ? JSON.parse(s) : null; } catch (e) { return null; }
+  }
+  function cfgWrite(cfg) {
+    try { sessionStorage.setItem(CFG_KEY, JSON.stringify(cfg)); } catch (e) {}
   }
 
   // ── CSRF token ─────────────────────────────────────────────────────
@@ -280,12 +305,24 @@
 
   // Tag reconciliation stats from the last /vms call, reported by the Re-sync toast.
   var lastTagStats = null;
+  // Server-side phase timings from the last /vms call (1.5.8), shown as the tooltip on a
+  // lazy tab's "Loaded in N.N s" line and in vmfState().
+  var lastVmsTiming = null;
 
-  async function fetchAll() {
-    var results = await Promise.all([get('/vms'), get('/db')]);
+  // opts (1.5.8, all optional): cached = accept the server's 30 s /vms cache and the
+  // session copy of /config (first open of an embedded tab only — every other caller,
+  // including Refresh and the reload after an action, asks for fresh data);
+  // strict = throw when /vms reports an error; embedded = skip /scans, which only the
+  // standalone dashboard's datastore section uses; timeoutMs = per-request timeout.
+  async function fetchAll(opts) {
+    opts = opts || {};
+    var t = opts.timeoutMs ? { timeoutMs: opts.timeoutMs } : null;
+    var results = await Promise.all([get('/vms' + (opts.cached ? '' : '?fresh=1'), t), get('/db', t)]);
+    if (opts.strict && results[0] && results[0].error) throw new Error(results[0].error);
     allVms = results[0].servers || [];
     var meta = results[0].meta || {};
     lastTagStats = meta.tags || null;
+    lastVmsTiming = meta.timing || null;
     // /vms carries the labels too, so the tree is never rendered with a stale one.
     if (meta.labels) {
       if (meta.labels.all) labels.all = meta.labels.all;
@@ -294,23 +331,28 @@
     var db = results[1];
     storedFolders = db.folders || [];
     assignments = db.assignments || {};
-    await loadConfig();
+    await loadConfig(opts);
     return db;
   }
 
   // Labels, tag mode, scan state and cached scan results. Failures here never break the
   // folder view: every value falls back to its 1.4.x default.
-  async function loadConfig() {
+  async function loadConfig(opts) {
+    opts = opts || {};
     try {
-      var cfg = await get('/config');
+      var t = opts.timeoutMs ? { timeoutMs: opts.timeoutMs } : null;
+      var cfg = opts.cached ? cfgRead() : null;
+      if (!cfg) {
+        cfg = await get('/config', t);
+        if (cfg && cfg.success === true) cfgWrite(cfg);
+      }
       scanEnabled = cfg.enabled === true;
       scanStores = cfg.datastores || [];
       tagMode = cfg.tagMode || 'off';
-      tagModeSource = cfg.tagModeSource || 'default';
       tagName = cfg.tagName || 'vmfolder';
       if (cfg.labelAll) labels.all = cfg.labelAll;
       if (cfg.labelUnorganized) labels.unorganized = cfg.labelUnorganized;
-      if (scanEnabled) {
+      if (scanEnabled && !opts.embedded) {
         var r = await get('/scans');
         scanCache = r.scans || {};
       } else { scanCache = {}; }
@@ -512,8 +554,8 @@
       storedFolders: storedFolders.length, paths: allPaths().length,
       activeFolder: activeFolder, activeDatastore: activeDatastore,
       cloudFilter: cloudFilter, contextCloud: window.vmfContextCloud || null, cloudUsed: activeCloudName(),
-      hostId: window.vmfHostId || null, readOnly: !!window.vmfReadOnly,
-      tagMode: tagMode, tagModeSource: tagModeSource, tagged: taggedVms().length,
+      hostId: window.vmfHostId || null, readOnly: !!window.vmfReadOnly, vmsTiming: lastVmsTiming,
+      tagMode: tagMode, tagged: taggedVms().length,
       labels: { all: labels.all, unorganized: labels.unorganized },
       lastTagStats: lastTagStats,
       clouds: Array.from(new Set(allVms.map(function(vm){ return vm.cloudName||''; }))).sort()
@@ -745,6 +787,29 @@
   }
 
   // ── Public ─────────────────────────────────────────────────────────
+  // Fetch + render. Throws on failure so a lazy tab can show the error and a Retry
+  // button; vmfReload() below keeps its 1.5.7 behaviour of reporting inside the table.
+  async function reloadCore(opts) {
+    await fetchAll(opts);
+    // Auto-detect cloud from context read off the Morpheus page (DOM-read synchronously).
+    // Adopt it only when it names a cloud the loaded VMs actually report, so a bad
+    // DOM scrape cannot latch a filter that empties every view.
+    if (cloudFilter === '__all__' && window.vmfContextCloud) {
+      if (allVms.some(function(vm){ return (vm.cloudName||'') === window.vmfContextCloud; })) {
+        cloudFilter = window.vmfContextCloud;
+      } else {
+        try { console.warn('vmFolders: context cloud "'+window.vmfContextCloud+'" matches no VM; staying on All'); } catch(e) {}
+        window.vmfContextCloud = null;
+      }
+    }
+    renderCloudBar(); renderTree(); renderDatastores(); renderVms();
+    // The page and both tabs start with a static "All VMs" breadcrumb; replace it
+    // with the configured label once config has loaded (also covers host/cluster tabs).
+    if (!activeDatastore) setBreadcrumb(activeFolder);
+    // renderVms() has already set the status to the rows it listed — do not overwrite
+    // it with the unscoped total (that is what showed "21 VMs loaded" against 9 rows).
+  }
+
   window.vmfReload = async function() {
     syncDarkMode();
     setStatus('Loading...');
@@ -753,24 +818,7 @@
     if(vl) vl.innerHTML='<div class="vmf-spin"><div class="vmf-spinner"></div>Loading VMs...</div>';
     selectedIds.clear(); updateMvBtn();
     try {
-      await fetchAll();
-      // Auto-detect cloud from context set by HBS template (DOM-read synchronously).
-      // Adopt it only when it names a cloud the loaded VMs actually report, so a bad
-      // DOM scrape cannot latch a filter that empties every view.
-      if (cloudFilter === '__all__' && window.vmfContextCloud) {
-        if (allVms.some(function(vm){ return (vm.cloudName||'') === window.vmfContextCloud; })) {
-          cloudFilter = window.vmfContextCloud;
-        } else {
-          try { console.warn('vmFolders: context cloud "'+window.vmfContextCloud+'" matches no VM; staying on All'); } catch(e) {}
-          window.vmfContextCloud = null;
-        }
-      }
-      renderCloudBar(); renderTree(); renderDatastores(); renderVms();
-      // The page and both tab templates ship a static "All VMs" breadcrumb; replace it
-      // with the configured label once config has loaded (also covers host/cluster tabs).
-      if (!activeDatastore) setBreadcrumb(activeFolder);
-      // renderVms() has already set the status to the rows it listed — do not overwrite
-      // it with the unscoped total (that is what showed "21 VMs loaded" against 9 rows).
+      await reloadCore();
     } catch(e) {
       if(vl) vl.innerHTML='<div class="vmf-empty"><div class="vmf-empty-icon">&#9888;</div><div style="color:#c00">Error: '+esc(e.message)+'</div></div>';
       setStatus('Error');
@@ -1119,62 +1167,27 @@
 
 
   // ── Settings ─────────────────────────────────────────────────────────
-  // Writes through /setConfig (tag mode, root labels) and /scanEnable (datastore
-  // scanning). Both stores are read back by /config, and the plugin settings form in
-  // Admin → Plugins still wins when it holds a value — the dialog says so when it does.
+  // Read-only. Since 1.5.5 every setting lives in the plugin settings form
+  // (Administration → Plugins → VM Folders) and nothing here writes one; this dialog
+  // shows the values /config reports and says where to change them.
   window.vmfSettings = function() {
-    var modes = [
-      ['off',     'off — ignore ' + tagName + ' tags (default)'],
-      ['keep',    'keep — assign from the tag and leave it in place (read-only)'],
-      ['consume', 'consume — assign, then REMOVE the ' + tagName + ' tag from the VM']
-    ];
-    var opts = modes.map(function(m) {
-      return '<option value="'+esc(m[0])+'"'+(tagMode===m[0]?' selected':'')+'>'+esc(m[1])+'</option>';
-    }).join('');
-    var override = (tagModeSource === 'plugin')
-      ? '<div class="vmf-note">The plugin settings form in <b>Admin &#8594; Plugins</b> is currently setting the tag mode, '+
-        'and it overrides this dialog. Clear it there to control the mode from here.</div>'
-      : '';
+    var modeText = {
+      off:     'off — ' + tagName + ' tags are ignored (default)',
+      keep:    'keep — assign from the tag and leave it in place (read-only)',
+      consume: 'consume — assign, then remove the ' + tagName + ' tag from the instance'
+    };
+    function row(label, value) {
+      return '<div class="vmf-fg"><label>'+esc(label)+'</label><div style="font-size:13px">'+esc(value)+'</div></div>';
+    }
     openModal('VM Folders Settings', [
-      override,
-      fg('vmfolder tag mode', '<select id="vmf-set-tagmode">'+opts+'</select>',
-         'One-way, tag &#8594; folder: a VM with a <b>'+esc(tagName)+'</b> tag whose value is a folder path is put in that folder. '+
-         'The plugin never writes a '+esc(tagName)+' tag. <b>consume</b> is the only mode that modifies a Morpheus record, '+
-         'and it removes nothing but the '+esc(tagName)+' tag itself.'),
-      fg('Label for all VMs', '<input id="vmf-set-laball" value="'+esc(labels.all)+'" placeholder="All VMs">', 'Display only.'),
-      fg('Label for unorganized VMs', '<input id="vmf-set-labunorg" value="'+esc(labels.unorganized)+'" placeholder="Unorganized">', 'Display only.'),
-      fg('Datastore scanning',
-         '<label style="text-transform:none;font-weight:400;font-size:13px;display:flex;align-items:center;gap:7px">'+
-         '<input type="checkbox" id="vmf-set-scan" style="width:auto"'+(scanEnabled?' checked':'')+'> Enable datastore scanning</label>',
-         'Runs read-only <code>find</code>/<code>head</code> commands on a hypervisor host through the Morpheus agent. Off by default.')
+      '<div class="vmf-note">Change these under <b>Administration &#8594; Plugins &#8594; VM Folders</b> (the edit form). '+
+        'Changes apply on the next dashboard load.</div>',
+      row('vmfolder tag mode', modeText[tagMode] || tagMode),
+      row('Label for all VMs', labels.all),
+      row('Label for unorganized VMs', labels.unorganized),
+      row('Datastore scanning', scanEnabled ? 'enabled' : 'disabled (default)')
     ], [
-      {l:'Cancel', fn:vmfCloseModal},
-      {l:'Save', primary:true, fn: async function() {
-        var mode = (document.getElementById('vmf-set-tagmode')||{}).value || 'off';
-        var la   = ((document.getElementById('vmf-set-laball')||{}).value || '').trim();
-        var lu   = ((document.getElementById('vmf-set-labunorg')||{}).value || '').trim();
-        var scan = !!(document.getElementById('vmf-set-scan')||{}).checked;
-        vmfCloseModal();
-        var errs = [];
-        async function put(key, value) {
-          var d = await post('/setConfig', {key: key, value: value});
-          if (!d.success) errs.push(key + ': ' + (d.error || 'failed'));
-          return d;
-        }
-        var modeRes = null;
-        if (mode !== tagMode) modeRes = await put('tagMode', mode);
-        if (la !== labels.all) await put('labelAll', la || 'All VMs');
-        if (lu !== labels.unorganized) await put('labelUnorganized', lu || 'Unorganized');
-        if (scan !== scanEnabled) {
-          var ds = await post('/scanEnable', {enabled: scan ? 'true' : 'false'});
-          if (!ds.success) errs.push('scanEnabled: ' + (ds.error || 'failed'));
-        }
-        if (errs.length) { vmfToast('Settings not saved — ' + errs.join('; '), true); }
-        else if (modeRes && modeRes.effectiveSource === 'plugin' && modeRes.value !== tagMode) {
-          vmfToast('Saved, but the plugin settings form is overriding the tag mode', true);
-        } else { vmfToast('Settings saved'); }
-        await vmfReload();
-      }}
+      {l:'Close', primary:true, fn:vmfCloseModal}
     ]);
   };
 
@@ -1345,6 +1358,263 @@
       vmfToast(parts.length ? 'Re-sync — '+parts.join(', ') : 'All VMs already current');
       await fetchAll(); renderTree(); renderDatastores(); renderVms();
     });
+  };
+
+  // ── Lazy embedded tabs (1.5.8) ─────────────────────────────────────
+  // The host, cluster and instance tab templates are static shells: a status line, a
+  // Load button and a Refresh button. Nothing under /plugin/vmFolders/ is requested and
+  // no tab CSS or markup exists until the tab pane is actually visible (onOpen) or Load
+  // is clicked (manual, or the per-user "Don't auto-load" box). Visibility comes from an
+  // IntersectionObserver on the shell, so nothing here depends on Morpheus tab markup.
+  var LAZY_KEY = 'vmFolders.tab.autoload';       // localStorage; '0' = don't auto-load
+  var LAZY_TIMEOUT_MS = 20000;                   // per request, so a hung call ends in Retry
+  var LAZY_CSS = {
+    bar: '.vmf-lazy-spin{display:inline-block;width:12px;height:12px;border:2px solid #CCCCCC;border-top-color:#01A982;border-radius:50%;animation:vmfLazySpin .7s linear infinite;vertical-align:middle;margin-right:6px}@keyframes vmfLazySpin{to{transform:rotate(360deg)}}',
+    server: "#vmf-st *{box-sizing:border-box;}#vmf-st{padding:0;background:var(--hpe-bg,#F5F5F5);min-height:500px;display:flex;flex-direction:column;}#vmf-st-hdr{display:flex;align-items:center;gap:8px;padding:10px 16px;background:var(--hpe-header,#425563);color:#fff;flex-shrink:0;}#vmf-st-hdr h3{font-size:14px;font-weight:600;display:flex;align-items:center;gap:6px;font-family:-apple-system,sans-serif;margin:0;}#vmf-st-hdr h3::before{content:'';display:inline-block;width:3px;height:16px;background:#01A982;border-radius:2px;}.vmf-hbadge{background:rgba(0,0,0,.3);color:#ECF0F1;border-radius:3px;padding:2px 8px;font-size:10px;font-weight:600;}.vmf-hbtn{padding:4px 10px;border-radius:4px !important;font-size:11px;cursor:pointer;white-space:nowrap;border:1px solid rgba(255,255,255,.4) !important;background:transparent !important;color:#fff !important;font-family:-apple-system,sans-serif;}.vmf-hbtn:hover{border-color:#fff !important;background:rgba(255,255,255,.1) !important;}#vmf-st .vmf-main{display:flex;flex:1;overflow:hidden;min-height:420px;}#vmf-st #vmf-cloud-bar{display:flex;flex-wrap:wrap;gap:3px;padding:6px 10px;background:var(--hpe-bg,#F5F5F5);border-bottom:1px solid var(--hpe-border,#CCCCCC);flex-shrink:0;}#vmf-st #vmf-tree{width:190px;background:var(--hpe-white,#fff);border-right:1px solid var(--hpe-border,#CCCCCC);display:flex;flex-direction:column;overflow:hidden;flex-shrink:0;}#vmf-st #vmf-tree-head{padding:8px 12px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.07em;color:var(--hpe-muted,#767676);background:var(--hpe-bg,#F5F5F5);border-bottom:1px solid var(--hpe-border,#CCCCCC);}#vmf-st #vmf-flist{flex:1;overflow-y:auto;padding:3px 0;}#vmf-st .vmf-fi{display:flex;align-items:center;gap:6px;padding:5px 12px;cursor:pointer;border-left:3px solid transparent;font-size:12px;font-family:-apple-system,sans-serif;color:var(--hpe-text,#333);}#vmf-st .vmf-fi:hover{background:var(--hpe-row-hover,#F9FAFA);}#vmf-st .vmf-fi.active{background:var(--hpe-selected,#E6F5F1);border-left-color:#01A982;color:#008567;font-weight:600;}#vmf-st .vmf-fi-icon{font-size:12px;flex-shrink:0;}#vmf-st .vmf-fi-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}#vmf-st .vmf-fi-count{font-size:10px;background:var(--hpe-border,#eee);color:var(--hpe-muted,#767676);border-radius:8px;padding:0 5px;flex-shrink:0;}#vmf-st .vmf-fi.active .vmf-fi-count{background:#c8ede4;color:#008567;}#vmf-st .vmf-divider{height:1px;background:var(--hpe-border,#CCCCCC);margin:2px 0;opacity:.5;}#vmf-st #vmf-content{flex:1;display:flex;flex-direction:column;overflow:hidden;}#vmf-st #vmf-toolbar{display:flex;align-items:center;gap:6px;padding:7px 12px;background:var(--hpe-white,#fff);border-bottom:1px solid var(--hpe-border,#CCCCCC);flex-shrink:0;flex-wrap:wrap;}#vmf-st #vmf-search{padding:4px 8px;border:1px solid var(--hpe-border,#CCCCCC);border-radius:4px !important;font-size:12px;max-width:200px;background:var(--hpe-white,#fff);color:var(--hpe-text,#333);}#vmf-st #vmf-search:focus{outline:none;border-color:#01A982;}#vmf-st #vmf-bc{font-size:11px;color:var(--hpe-muted,#767676);font-family:-apple-system,sans-serif;}#vmf-st #vmf-vlist{flex:1;overflow-y:auto;background:var(--hpe-white,#fff);}#vmf-st #vmf-status{padding:4px 12px;background:var(--hpe-bg,#F5F5F5);border-top:1px solid var(--hpe-border,#CCCCCC);font-size:10px;color:var(--hpe-muted,#767676);font-family:-apple-system,sans-serif;}#vmf-st table.vmft{width:100%;border-collapse:collapse;background:var(--hpe-white,#fff);}#vmf-st table.vmft thead th{position:sticky;top:0;background:var(--hpe-bg,#F5F5F5);border-bottom:2px solid var(--hpe-border,#CCCCCC);padding:6px 8px;text-align:left;font-weight:600;font-size:10px;text-transform:uppercase;color:var(--hpe-muted,#767676);white-space:nowrap;cursor:pointer;font-family:-apple-system,sans-serif;}#vmf-st table.vmft tbody tr{border-bottom:1px solid var(--hpe-border,#f0f0f0);}#vmf-st table.vmft tbody tr:hover{background:var(--hpe-row-hover,#F9FAFA);}#vmf-st table.vmft tbody tr.sel{background:var(--hpe-selected,#E6F5F1);}#vmf-st table.vmft td{padding:5px 8px;font-size:11px;font-family:-apple-system,sans-serif;vertical-align:middle;color:var(--hpe-text,#333);}#vmf-st .vmft-name a{color:#008567;text-decoration:none;font-weight:500;}#vmf-st .vmft-name a:hover{text-decoration:underline;}#vmf-st .vmf-dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:3px;vertical-align:middle;}#vmf-st .vmf-tag{background:var(--hpe-selected,#e6f5f1);color:#008567;border-radius:3px;padding:1px 6px;font-size:10px;font-weight:500;border:1px solid #b3e0d5;}#vmf-st .vmf-act{padding:2px 7px !important;font-size:11px !important;border:1px solid var(--hpe-border,#CCCCCC) !important;border-radius:3px !important;background:var(--hpe-white,#fff) !important;cursor:pointer !important;color:var(--hpe-text,#333) !important;font-family:-apple-system,sans-serif !important;line-height:1.4 !important;min-height:0 !important;height:auto !important;}#vmf-st .vmf-act:hover{border-color:#01A982 !important;color:#008567 !important;}#vmf-st .vmf-act-more{font-weight:bold;letter-spacing:1px;}#vmf-st .vmf-pw-btn{color:#fff !important;}#vmf-st .vmf-start-btn{background:#01A982 !important;border-color:#008567 !important;color:#fff !important;padding:2px 7px !important;font-size:11px !important;border-radius:3px !important;line-height:1.4 !important;}#vmf-st .vmf-stop-btn{background:#c00 !important;border-color:#a00 !important;color:#fff !important;padding:2px 7px !important;font-size:11px !important;border-radius:3px !important;line-height:1.4 !important;}#vmf-st .vmf-start-btn:hover{background:#008567 !important;}#vmf-st .vmf-stop-btn:hover{background:#a00 !important;}#vmf-st .vmf-empty, #vmf-st .vmf-spin{display:flex;align-items:center;justify-content:center;padding:30px;color:var(--hpe-muted,#767676);font-family:-apple-system,sans-serif;gap:8px;font-size:12px;}#vmf-st .vmf-spinner{width:14px;height:14px;border:2px solid var(--hpe-border,#CCCCCC);border-top-color:#01A982;border-radius:50%;animation:vmfSpin .7s linear infinite;}@keyframes vmfSpin{to{transform:rotate(360deg);}}.vmf-badge-un{display:inline-block;background:#fff3e0;color:#8a5300;border:1px solid #f0c890;border-radius:3px;padding:0 5px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.03em;vertical-align:middle;}body.dark .vmf-badge-un{background:#3A2E1A;color:#E0B870;border-color:#5A4828;}",
+    cluster: "#vmf-ct *{box-sizing:border-box;}#vmf-ct{padding:0;background:var(--hpe-bg,#F5F5F5);min-height:500px;display:flex;flex-direction:column;}#vmf-ct-hdr{display:flex;align-items:center;gap:8px;padding:10px 16px;background:var(--hpe-header,#425563);color:#fff;flex-shrink:0;}#vmf-ct-hdr span.title{font-size:14px;font-weight:600;display:flex;align-items:center;gap:6px;font-family:-apple-system,sans-serif;}#vmf-ct-hdr span.title::before{content:'';display:inline-block;width:3px;height:16px;background:#01A982;border-radius:2px;}.vmf-cl-btn{padding:4px 10px;border-radius:4px !important;font-size:11px;cursor:pointer;border:1px solid rgba(255,255,255,.4) !important;background:transparent !important;color:#fff !important;text-decoration:none;display:inline-block;font-family:-apple-system,sans-serif;}.vmf-cl-btn:hover{border-color:#fff !important;background:rgba(255,255,255,.1) !important;}#vmf-ct .vmf-main{display:flex;flex:1;overflow:hidden;min-height:420px;}#vmf-ct #vmf-cloud-bar{display:flex;flex-wrap:wrap;gap:3px;padding:6px 10px;background:var(--hpe-bg,#F5F5F5);border-bottom:1px solid var(--hpe-border,#CCCCCC);flex-shrink:0;}#vmf-ct #vmf-tree{width:190px;background:var(--hpe-white,#fff);border-right:1px solid var(--hpe-border,#CCCCCC);display:flex;flex-direction:column;overflow:hidden;flex-shrink:0;}#vmf-ct #vmf-tree-head{padding:8px 12px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.07em;color:var(--hpe-muted,#767676);background:var(--hpe-bg,#F5F5F5);border-bottom:1px solid var(--hpe-border,#CCCCCC);}#vmf-ct #vmf-flist{flex:1;overflow-y:auto;padding:3px 0;}#vmf-ct .vmf-fi{display:flex;align-items:center;gap:6px;padding:5px 12px;cursor:pointer;border-left:3px solid transparent;font-size:12px;font-family:-apple-system,sans-serif;color:var(--hpe-text,#333);}#vmf-ct .vmf-fi:hover{background:var(--hpe-row-hover,#F9FAFA);}#vmf-ct .vmf-fi.active{background:var(--hpe-selected,#E6F5F1);border-left-color:#01A982;color:#008567;font-weight:600;}#vmf-ct .vmf-fi-icon{font-size:12px;flex-shrink:0;}#vmf-ct .vmf-fi-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}#vmf-ct .vmf-fi-count{font-size:10px;background:var(--hpe-border,#eee);color:var(--hpe-muted,#767676);border-radius:8px;padding:0 5px;flex-shrink:0;}#vmf-ct .vmf-fi.active .vmf-fi-count{background:#c8ede4;color:#008567;}#vmf-ct .vmf-divider{height:1px;background:var(--hpe-border,#CCCCCC);margin:2px 0;opacity:.5;}#vmf-ct #vmf-content{flex:1;display:flex;flex-direction:column;overflow:hidden;}#vmf-ct #vmf-toolbar{display:flex;align-items:center;gap:6px;padding:7px 12px;background:var(--hpe-white,#fff);border-bottom:1px solid var(--hpe-border,#CCCCCC);flex-shrink:0;flex-wrap:wrap;}#vmf-ct #vmf-search{padding:4px 8px;border:1px solid var(--hpe-border,#CCCCCC);border-radius:4px !important;font-size:12px;max-width:200px;background:var(--hpe-white,#fff);color:var(--hpe-text,#333);}#vmf-ct #vmf-search:focus{outline:none;border-color:#01A982;}#vmf-ct #vmf-bc{font-size:11px;color:var(--hpe-muted,#767676);font-family:-apple-system,sans-serif;}#vmf-ct #vmf-vlist{flex:1;overflow-y:auto;background:var(--hpe-white,#fff);}#vmf-ct #vmf-status{padding:4px 12px;background:var(--hpe-bg,#F5F5F5);border-top:1px solid var(--hpe-border,#CCCCCC);font-size:10px;color:var(--hpe-muted,#767676);font-family:-apple-system,sans-serif;}#vmf-ct table.vmft{width:100%;border-collapse:collapse;background:var(--hpe-white,#fff);}#vmf-ct table.vmft thead th{position:sticky;top:0;background:var(--hpe-bg,#F5F5F5);border-bottom:2px solid var(--hpe-border,#CCCCCC);padding:6px 8px;text-align:left;font-weight:600;font-size:10px;text-transform:uppercase;color:var(--hpe-muted,#767676);white-space:nowrap;cursor:pointer;font-family:-apple-system,sans-serif;}#vmf-ct table.vmft tbody tr{border-bottom:1px solid var(--hpe-border,#f0f0f0);}#vmf-ct table.vmft tbody tr:hover{background:var(--hpe-row-hover,#F9FAFA);}#vmf-ct table.vmft td{padding:5px 8px;font-size:11px;font-family:-apple-system,sans-serif;vertical-align:middle;color:var(--hpe-text,#333);}#vmf-ct .vmft-name a{color:#008567;text-decoration:none;font-weight:500;}#vmf-ct .vmft-name a:hover{text-decoration:underline;}#vmf-ct .vmf-dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:3px;vertical-align:middle;}#vmf-ct .vmf-tag{background:var(--hpe-selected,#e6f5f1);color:#008567;border-radius:3px;padding:1px 6px;font-size:10px;font-weight:500;border:1px solid #b3e0d5;}#vmf-ct .vmf-act{padding:2px 7px !important;font-size:11px !important;border:1px solid var(--hpe-border,#CCCCCC) !important;border-radius:3px !important;background:var(--hpe-white,#fff) !important;cursor:pointer !important;color:var(--hpe-text,#333) !important;font-family:-apple-system,sans-serif !important;line-height:1.4 !important;min-height:0 !important;height:auto !important;}#vmf-ct .vmf-act:hover{border-color:#01A982 !important;color:#008567 !important;}#vmf-ct .vmf-pw-btn{color:#fff !important;}#vmf-ct .vmf-start-btn{background:#01A982 !important;border-color:#008567 !important;color:#fff !important;padding:2px 7px !important;font-size:11px !important;border-radius:3px !important;line-height:1.4 !important;}#vmf-ct .vmf-stop-btn{background:#c00 !important;border-color:#a00 !important;color:#fff !important;padding:2px 7px !important;font-size:11px !important;border-radius:3px !important;line-height:1.4 !important;}#vmf-ct .vmf-start-btn:hover{background:#008567 !important;}#vmf-ct .vmf-stop-btn:hover{background:#a00 !important;}#vmf-ct .vmf-empty, #vmf-ct .vmf-spin{display:flex;align-items:center;justify-content:center;padding:30px;color:var(--hpe-muted,#767676);font-family:-apple-system,sans-serif;gap:8px;font-size:12px;}#vmf-ct .vmf-spinner{width:14px;height:14px;border:2px solid var(--hpe-border,#CCCCCC);border-top-color:#01A982;border-radius:50%;animation:vmfCtSpin .7s linear infinite;}@keyframes vmfCtSpin{to{transform:rotate(360deg);}}.vmf-badge-un{display:inline-block;background:#fff3e0;color:#8a5300;border:1px solid #f0c890;border-radius:3px;padding:0 5px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.03em;vertical-align:middle;}body.dark .vmf-badge-un{background:#3A2E1A;color:#E0B870;border-color:#5A4828;}",
+    instance: "#vmf-inst-wrap{padding:20px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;}#vmf-inst-wrap *{box-sizing:border-box;}.vmf-inst-card{background:#fff;border:1px solid #CCCCCC;border-radius:6px;overflow:hidden;max-width:600px;}.vmf-inst-head{background:#425563;color:#fff;padding:12px 16px;display:flex;align-items:center;gap:8px;}.vmf-inst-head h3{font-size:14px;font-weight:600;display:flex;align-items:center;gap:6px;margin:0;}.vmf-inst-head h3::before{content:'';display:inline-block;width:3px;height:16px;background:#01A982;border-radius:2px;}.vmf-inst-body{padding:20px;}.vmf-inst-row{display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid #f0f0f0;}.vmf-inst-row:last-child{border-bottom:none;}.vmf-inst-label{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#767676;width:100px;flex-shrink:0;}.vmf-inst-val{font-size:13px;color:#333;flex:1;}.vmf-inst-val.folder{color:#008567;font-weight:500;}.vmf-inst-val.unorg{color:#767676;font-style:italic;}.vmf-inst-actions{display:flex;gap:8px;padding-top:16px;}.vmf-inst-btn{padding:7px 14px;border-radius:4px;font-size:12px;font-weight:500;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;gap:5px;}.vmf-inst-btn-primary{background:#01A982;border:1px solid #008567;color:#fff;}.vmf-inst-btn-primary:hover{background:#008567;}.vmf-inst-btn-outline{background:#fff;border:1px solid #CCCCCC;color:#333;}.vmf-inst-btn-outline:hover{border-color:#01A982;color:#008567;}.vmf-inst-loading{color:#767676;font-size:13px;display:flex;align-items:center;gap:8px;}.vmf-inst-spinner{width:14px;height:14px;border:2px solid #CCCCCC;border-top-color:#01A982;border-radius:50%;animation:vmfInstSpin .7s linear infinite;}@keyframes vmfInstSpin{to{transform:rotate(360deg);}}.vmf-inst-move-form{display:none;margin-top:12px;padding:12px;background:#F5F5F5;border-radius:4px;border:1px solid #CCCCCC;}.vmf-inst-move-form label{display:block;font-size:11px;font-weight:600;margin-bottom:4px;color:#767676;text-transform:uppercase;}.vmf-inst-move-form input{width:100%;padding:7px 10px;border:1px solid #CCCCCC;border-radius:4px;font-size:13px;margin-bottom:8px;}.vmf-inst-move-form input:focus{outline:none;border-color:#01A982;}"
+  };
+
+  function lazyAutoPref() {
+    try { return localStorage.getItem(LAZY_KEY) !== '0'; } catch (e) { return true; }
+  }
+  function lazySetAutoPref(on) {
+    try { if (on) localStorage.removeItem(LAZY_KEY); else localStorage.setItem(LAZY_KEY, '0'); } catch (e) {}
+  }
+  function lazyCss(kind) {
+    var id = 'vmf-css-' + kind;
+    if (document.getElementById(id)) return;
+    var s = document.createElement('style');
+    s.id = id;
+    s.textContent = LAZY_CSS[kind];
+    document.head.appendChild(s);
+  }
+
+  // Cloud name for the host/cluster tab, read from the Morpheus detail page (moved here
+  // from the tab templates). vmfReload/reloadCore discards a value that matches no VM.
+  function lazyContextCloud(fromModel) {
+    if (fromModel && fromModel !== 'null' && fromModel !== 'undefined') return fromModel;
+    try {
+      var labelled = window.vmfDetectContextCloud();
+      if (labelled) return labelled;
+      var ic = document.querySelector('.info-column a[href*="/infrastructure/clouds/"]');
+      if (ic) return ic.textContent.trim();
+      var all = document.querySelectorAll('a[href*="/infrastructure/clouds/"]');
+      for (var i = 0; i < all.length; i++) {
+        if (!all[i].closest('nav, header, #main-nav, .main-nav, .navbar')) return all[i].textContent.trim();
+      }
+    } catch (e) {}
+    return '';
+  }
+
+  // The tree + table both tabs share (same ids the standalone dashboard uses).
+  function lazyPanelHtml() {
+    return '<div class="vmf-main">' +
+      '<div id="vmf-tree"><div id="vmf-cloud-bar"></div><div id="vmf-tree-head">Folders</div>' +
+        '<div id="vmf-flist"><div class="vmf-spin"><div class="vmf-spinner"></div>Loading...</div></div></div>' +
+      '<div id="vmf-content"><div id="vmf-toolbar">' +
+        '<input id="vmf-search" type="text" placeholder="Search VMs...">' +
+        '<span id="vmf-bc">&#128193; <b>All VMs</b></span></div>' +
+        '<div id="vmf-vlist"><div class="vmf-spin"><div class="vmf-spinner"></div>Loading VMs...</div></div>' +
+        '<div id="vmf-status">Loading...</div></div></div>';
+  }
+  function lazyServerHtml(name) {
+    return '<div id="vmf-st"><div id="vmf-st-hdr"><h3>VM Folders</h3>' +
+      '<span class="vmf-hbadge">' + esc(name) + '</span>' +
+      '<button class="vmf-hbtn" id="vmf-resync-btn" title="Re-sync VMs to current host folders">&#8635; Re-sync</button>' +
+      '<a href="/plugin/vmFolders" target="_blank" class="vmf-hbtn" style="text-decoration:none;margin-left:auto;">Open Full View &#8599;</a>' +
+      '</div>' + lazyPanelHtml() + '</div>';
+  }
+  function lazyClusterHtml(name) {
+    return '<div id="vmf-ct"><div id="vmf-ct-hdr"><span class="title">VM Folders</span>' +
+      '<span style="font-size:11px;color:#B0BEC5;">' + esc(name) + '</span>' +
+      '<a href="/plugin/vmFolders" target="_blank" class="vmf-cl-btn" style="margin-left:auto;">Open Full View &#8599;</a>' +
+      '</div>' + lazyPanelHtml() + '</div>';
+  }
+
+  // Host and cluster tabs. The first load builds the panel and resets the shared view
+  // state (a previous detail page's host or cloud filter must not carry over); a Refresh
+  // keeps what is on screen and only replaces the data.
+  async function lazyLoadFolders(kind, wrap, body, cached) {
+    var ds = wrap.dataset || {};
+    if (!body.firstChild) {
+      lazyCss(kind);
+      body.innerHTML = kind === 'server' ? lazyServerHtml(ds.serverName || 'Host') : lazyClusterHtml(ds.serverName || 'Cluster');
+      window.vmfReadOnly = true;
+      window.vmfHostId = kind === 'server' ? (ds.serverId || '') : '';
+      window.vmfContextCloud = lazyContextCloud(kind === 'cluster' ? (ds.cloudName || '') : '');
+      cloudFilter = '__all__'; searchQ = '';
+      resetSelection('__all__', null);
+      var rs = body.querySelector('#vmf-resync-btn');
+      if (rs) rs.addEventListener('click', function() { window.vmfResyncHosts(); });
+      var se = body.querySelector('#vmf-search');
+      if (se) se.addEventListener('input', function() { window.vmfFilter(se.value); });
+    }
+    syncDarkMode();
+    selectedIds.clear(); updateMvBtn();
+    await reloadCore({ cached: cached, strict: true, embedded: true, timeoutMs: LAZY_TIMEOUT_MS });
+  }
+
+  // Instance tab: which folder this instance's VM is in, with assign / move / remove.
+  // (Moved here from the template; the buttons are wired by delegation, not onclick.)
+  function lazyInstanceRender(wrap, state) {
+    var folder = state.folder, isOrg = folder && folder !== '/';
+    var folderDisplay = isOrg
+      ? '<span class="vmf-inst-val folder">&#128193; ' + esc(folder) + '</span>'
+      : '<span class="vmf-inst-val unorg">' + esc(state.labelUnorganized) + '</span>';
+    var html = '<div class="vmf-inst-row"><span class="vmf-inst-label">Instance</span>' +
+      '<span class="vmf-inst-val">' + esc(state.instanceName) + '</span></div>' +
+      '<div class="vmf-inst-row"><span class="vmf-inst-label">Server ID</span>' +
+      '<span class="vmf-inst-val">' + esc(state.serverId || '—') + '</span></div>' +
+      '<div class="vmf-inst-row"><span class="vmf-inst-label">Folder</span>' + folderDisplay + '</div>';
+    html += '<div class="vmf-inst-actions">' +
+      '<a href="/plugin/vmFolders" target="_blank" class="vmf-inst-btn vmf-inst-btn-outline">&#128196; Open VM Folders</a>' +
+      '<button type="button" class="vmf-inst-btn vmf-inst-btn-outline" data-inst-act="toggle">&#128193; ' + (isOrg ? 'Move Folder' : 'Assign Folder') + '</button>' +
+      '</div>';
+    html += '<div class="vmf-inst-move-form" id="vmf-inst-mf"><label>Folder Path</label>' +
+      '<input id="vmf-inst-fp" type="text" placeholder="/Production/Web" value="' + (isOrg ? esc(folder) : '') + '">' +
+      '<div style="display:flex;gap:6px;">' +
+      '<button type="button" class="vmf-inst-btn vmf-inst-btn-primary" data-inst-act="save">Save</button>' +
+      '<button type="button" class="vmf-inst-btn vmf-inst-btn-outline" data-inst-act="toggle">Cancel</button>' +
+      (isOrg ? '<button type="button" class="vmf-inst-btn vmf-inst-btn-outline" style="color:#c00;border-color:#c00" data-inst-act="remove">Remove</button>' : '') +
+      '</div></div>';
+    var c = wrap.querySelector('#vmf-inst-content');
+    if (c) c.innerHTML = html;
+  }
+
+  async function lazyInstanceAct(wrap, state, act) {
+    if (act === 'toggle') {
+      var f = wrap.querySelector('#vmf-inst-mf');
+      if (f) f.style.display = (f.style.display === 'none' || !f.style.display) ? 'block' : 'none';
+      return;
+    }
+    if (!state.serverId) return;
+    try {
+      if (act === 'save') {
+        var el = wrap.querySelector('#vmf-inst-fp');
+        var path = el ? el.value.trim() : '';
+        if (!path) return;
+        if (path.charAt(0) !== '/') path = '/' + path;
+        var d = await post('/assign', { vmId: state.serverId, path: path });
+        if (d.success) { state.folder = path; lazyInstanceRender(wrap, state); } else { alert('Failed: ' + d.error); }
+      } else if (act === 'remove') {
+        if (!confirm('Remove from folder?')) return;
+        var r = await post('/unassign', { vmId: state.serverId });
+        if (r.success) { state.folder = ''; lazyInstanceRender(wrap, state); } else { alert('Failed: ' + r.error); }
+      }
+    } catch (e) { alert('Error: ' + e.message); }
+  }
+
+  async function lazyLoadInstance(wrap, body, cached) {
+    var ds = wrap.dataset || {};
+    var t = { timeoutMs: LAZY_TIMEOUT_MS };
+    var state = wrap.__vmfInst;
+    if (!body.firstChild || !state) {
+      lazyCss('instance');
+      state = wrap.__vmfInst = { serverId: ds.serverId || '', instanceName: ds.instanceName || '', folder: '', labelUnorganized: 'Unorganized' };
+      body.innerHTML = '<div id="vmf-inst-wrap"><div class="vmf-inst-card"><div class="vmf-inst-head"><h3>VM Folders</h3>' +
+        '<span style="font-size:11px;color:#B0BEC5;">' + esc(state.instanceName) + '</span>' +
+        '<a href="/plugin/vmFolders" target="_blank" style="margin-left:auto;font-size:11px;color:#B0BEC5;text-decoration:none;border:1px solid rgba(255,255,255,.3);padding:3px 8px;border-radius:3px;">Full View &#8599;</a>' +
+        '</div><div class="vmf-inst-body"><div id="vmf-inst-content">' +
+        '<div class="vmf-inst-loading"><div class="vmf-inst-spinner"></div>Loading folder info...</div></div></div></div></div>';
+      if (!wrap.__vmfInstWired) {
+        wrap.__vmfInstWired = true;
+        body.addEventListener('click', function(e) {
+          var b = e.target.closest('[data-inst-act]');
+          if (b && wrap.__vmfInst) lazyInstanceAct(wrap, wrap.__vmfInst, b.getAttribute('data-inst-act'));
+        });
+      }
+    }
+    // The provider no longer makes a platform call to find the VM behind the instance.
+    // When the instance model it was handed carried no workload, ask once, now.
+    if (!state.serverId && ds.instanceId) {
+      var r = await get('/instanceServer?instanceId=' + encodeURIComponent(ds.instanceId), t);
+      if (r && r.serverId) state.serverId = String(r.serverId);
+    }
+    var cfg = cached ? cfgRead() : null;
+    var res = await Promise.all([
+      get('/db', t),
+      cfg ? Promise.resolve(cfg) : get('/config', t).catch(function() { return {}; })
+    ]);
+    var db = res[0] || {};
+    cfg = res[1] || {};
+    if (cfg.success === true) cfgWrite(cfg);
+    if (cfg.labelUnorganized) state.labelUnorganized = cfg.labelUnorganized;
+    var asg = db.assignments || {};
+    state.folder = state.serverId ? (asg[state.serverId] || '') : '';
+    lazyInstanceRender(wrap, state);
+  }
+
+  // Called by each tab shell: kind is 'server', 'cluster' or 'instance'.
+  window.vmfLazyInit = function(kind) {
+    var wrap = document.getElementById('vmf-lazy-' + kind);
+    if (!wrap || wrap.__vmfLazy) return;
+    wrap.__vmfLazy = true;
+    var statusEl = wrap.querySelector('.vmf-lazy-status');
+    var loadBtn = wrap.querySelector('.vmf-lazy-load');
+    var refreshBtn = wrap.querySelector('.vmf-lazy-refresh');
+    var noAuto = wrap.querySelector('.vmf-lazy-noauto');
+    var body = wrap.querySelector('.vmf-lazy-body');
+    if (!body) return;
+    var manual = ((wrap.dataset && wrap.dataset.loadMode) || 'onOpen') === 'manual';
+    var loaded = false, busy = false, failed = false;
+
+    function show(el, on) { if (el) el.style.display = on ? '' : 'none'; }
+    function status(text, spin) {
+      if (!statusEl) return;
+      statusEl.innerHTML = (spin ? '<span class="vmf-lazy-spin"></span>' : '') + esc(text);
+    }
+
+    async function run(cached) {
+      if (busy) return;
+      busy = true;
+      var t0 = Date.now();
+      lazyCss('bar');
+      show(loadBtn, false); show(refreshBtn, false);
+      status('Loading… 0 s', true);
+      var tick = setInterval(function() {
+        status('Loading… ' + Math.round((Date.now() - t0) / 1000) + ' s', true);
+      }, 1000);
+      try {
+        if (kind === 'instance') await lazyLoadInstance(wrap, body, cached);
+        else await lazyLoadFolders(kind, wrap, body, cached);
+        loaded = true; failed = false;
+        status('Loaded in ' + ((Date.now() - t0) / 1000).toFixed(1) + ' s', false);
+        if (statusEl) statusEl.title = (kind !== 'instance' && lastVmsTiming) ? ('Server /vms: ' + JSON.stringify(lastVmsTiming)) : '';
+        show(refreshBtn, true);
+      } catch (e) {
+        failed = true;
+        // A failed first load leaves no half-built panel behind; a failed Refresh
+        // keeps the data that was already on screen.
+        if (!loaded) { body.innerHTML = ''; wrap.__vmfInst = null; }
+        status('Failed: ' + ((e && e.message) || 'unknown error'), false);
+        if (loadBtn) { loadBtn.textContent = 'Retry'; show(loadBtn, true); }
+      } finally {
+        clearInterval(tick);
+        busy = false;
+      }
+    }
+
+    if (noAuto) {
+      noAuto.checked = !lazyAutoPref();
+      noAuto.addEventListener('change', function() { lazySetAutoPref(!noAuto.checked); });
+    }
+    // Load uses the short server-side cache; Retry and Refresh always bypass it.
+    if (loadBtn) loadBtn.addEventListener('click', function() { run(!failed && !loaded); });
+    if (refreshBtn) refreshBtn.addEventListener('click', function() { run(false); });
+
+    if (!manual && lazyAutoPref() && typeof IntersectionObserver === 'function') {
+      var io = new IntersectionObserver(function(entries) {
+        for (var i = 0; i < entries.length; i++) {
+          if (entries[i].isIntersecting) {
+            io.disconnect();
+            if (!loaded && !busy && lazyAutoPref()) run(true);
+            return;
+          }
+        }
+      });
+      io.observe(wrap);
+    }
   };
 
   function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}

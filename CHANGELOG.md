@@ -1,8 +1,160 @@
 # Changelog
 
-Released versions: **1.0.0**, **1.1.0**, **1.1.5**, **1.2.0**, **1.3.6**, **1.4.1**, **1.5.4**.
-Intermediate versions (1.1.1–1.1.4, 1.3.0–1.3.5, 1.3.7–1.3.8, 1.4.0, 1.5.0, 1.5.1, 1.5.2, 1.5.3) were internal builds — several were
+Released versions: **1.0.0**, **1.1.0**, **1.1.5**, **1.2.0**, **1.3.6**, **1.4.1**, **1.5.4**, **1.5.6**, **1.5.10**.
+Intermediate versions (1.1.1–1.1.4, 1.3.0–1.3.5, 1.3.7–1.3.8, 1.4.0, 1.5.0–1.5.3, 1.5.5, 1.5.7–1.5.9) were internal builds — several were
 diagnostic-only — and their net effect is folded into the release that followed them.
+
+## [1.5.10] - 2026-11-19
+
+The release that carries the lazy tabs (1.5.8) and the script cache fix (1.5.9) to the public
+repo. Upgrading from 1.5.6 needs no role or settings change.
+
+### Removed
+- **The 1.5.7 permission probe.** `/db` is back on `admin-cm` like every other route, the
+  `/permProbe` route and its log line are gone, and the plugin no longer declares the
+  `VM Folders: View` permission. 1.5.7–1.5.9 were internal builds; a real permission split
+  remains planned work.
+
+### Changed
+- README: the embedded tabs' load-on-open behaviour, the two tab settings, the Gradle
+  wrapper and the tested platform versions are documented.
+- Comments and changelog entries no longer point at internal working files.
+
+## [1.5.9] - 2026-11-19
+
+### Fixed
+- **A browser that had 1.5.7 kept running the 1.5.7 `vmFolders.js`.** Found on a live appliance
+  right after the 1.5.8 upload: Morpheus serves `/assets/plugin/vm-folders/vmFolders.js`
+  with `Cache-Control: public, max-age=31536000` and a constant `ETag: "vmFolders.js"`, so
+  the old script stayed in the browser cache and the new tab shells reported "script is
+  out of date" until a hard refresh. The script URL now carries the plugin version
+  (`vmFolders.js?v=1.5.9`) in the global nav template and in the three tab shells, taken
+  from `VmFoldersController.VERSION`, so every build is a new URL and no extra file needs
+  a version bump. (Every earlier release had the same stale-script problem after an
+  upgrade; it was simply less visible.)
+
+### Measured with 1.5.8 on Morpheus 9.1.0 (37 servers)
+- Host, cluster and instance pages: no `/plugin/vmFolders/` request until the tab is opened.
+- Fresh `/vms`: 2.2–3.4 s, of which `computeServer.list()` is 2.0–3.0 s, tag reconcile
+  (consume mode, `instance.list()`) 0.25–0.85 s, database and row building under 10 ms.
+- Cached `/vms`: about 20 ms.
+
+## [1.5.8] - 2026-11-18
+
+Lazy tabs and a tab off switch. Internal build on the 1.5.7 tree (the permission probe was
+still in place); folded into 1.5.10.
+
+Before: the host and cluster tab templates called `vmfReload()` as Morpheus rendered them
+into the detail page, so `/vms`, `/db`, `/config` (and `/scans` when scanning is on) were
+requested on every host and cluster page whether or not the tab was opened; the instance
+tab requested `/db` and `/config` the same way. `VmFoldersInstanceTabProvider.renderTemplate()`
+also ran `morpheusContext.buildInstanceConfig(...).blockingGet()` on the request thread for
+every instance page.
+
+### Added
+- Plugin settings **Show the VM Folders tab** (`tabEnabled`, checkbox, default on) and
+  **Tab load mode** (`tabLoadMode`, `onOpen` | `manual`, default `onOpen`). The mode is a
+  text field validated in code: `OptionType` has no option-source-free select.
+- `VmFoldersSettings` — the settings form cached for 60 s, the only thing `show()` and
+  `renderTemplate()` read besides the object Morpheus hands them.
+- `GET /instanceServer?instanceId=N` (read-only, `admin-cm`): the VM behind an instance,
+  asked for by the instance tab after it is opened and only when the provider had none.
+- `/vms` returns `meta.timing` (`listMs`, `tagsMs`, `dbMs`, `buildMs`, `totalMs`) and logs
+  the same as `VmFolders vms: …` — at info when the call takes 500 ms or more.
+- `/vms` is cached for 30 s per user. Only a request without `?fresh=1` is served from it,
+  and only the first open of an embedded tab sends one. Any write to the plugin database,
+  a restore and a power action drop the cache.
+- `/config` reports `tabEnabled`, `tabEnabledRaw` and `tabLoadMode`.
+
+### Changed
+- The three tab templates are static shells under 2 KB: a status line, **Load**,
+  **Refresh**, a per-user "Don't auto-load this tab" box (`localStorage`
+  `vmFolders.tab.autoload`) and one nonce'd script. The tab CSS and markup moved into
+  `vmFolders.js` and are injected on first load.
+- Nothing under `/plugin/vmFolders/` is requested until the tab pane is visible
+  (`IntersectionObserver` on the shell) or **Load** is clicked. While loading: spinner and
+  elapsed seconds. On failure: the error and **Retry**. After: "Loaded in N.N s" (hover for
+  the server's phase timings) and **Refresh**. Each request has a 20 s timeout.
+- `show()` returns false on all three tab providers when `tabEnabled` is off.
+- `VmFoldersInstanceTabProvider.renderTemplate()` makes no platform call.
+- Embedded tabs keep `/config` in `sessionStorage` (`vmFolders.config`) and no longer
+  request `/scans`, which only the standalone dashboard's datastore section uses. The
+  dashboard and every Refresh still fetch `/config` and rewrite the stored copy.
+- Opening a host or cluster tab resets the shared view state (host filter, cloud filter,
+  selection) instead of inheriting it from the previous page.
+
+### Fixed
+- The search box on the host and cluster tabs was never wired; it filters now.
+
+### Not changed
+- The standalone dashboard at `/plugin/vmFolders` loads exactly as in 1.5.7 (always fresh).
+- `vms()` itself: the list calls, tag reconcile and rule 6 are untouched. The 4 s is not
+  explained by the source — `instancesByServerId` is already one `instance.list()` and a
+  map, and `scannableDatastores` runs from `/config` and `/scans`, not `/vms`. The new
+  timing line is there to show which phase it is before anything is rewritten.
+
+## [1.5.7] - 2026-09-30
+
+**Internal permission probe — do not publish.** SPEC-1.6.0 Step 0.
+
+- Declares one plugin permission, `vm-folders-view` (none/read/full), via `Plugin.permissions`.
+- `/db` is gated on `vm-folders-view: read` instead of `admin-cm: full`. Every other route is
+  unchanged.
+- New read-only `GET /permProbe`, gated on the list `[vm-folders-view: read, admin-cm: full]`,
+  returns the caller's own values for those two permissions.
+- `VmFolders perm/probe:` log line on every request that reaches `/db` or `/permProbe`.
+
+## [1.5.6] - 2026-09-30
+
+### Fixed
+- **`consume` no longer found the instance (regression in 1.5.5).** 1.5.5 removed the
+  workload-side lookups on the belief that `instance.containers` is hydrated. It isn't
+  shown to be: 1.5.4's `found=instance.containers` label also covered a workload lookup by
+  `instance.id`, which is what resolved the instance on 9.0.2. With that gone, 1.5.5 left
+  the instance tag in place (`instance#- removed=null (no instance)`). Restored, each with
+  its own label in the audit line's `found=`: the `containers` scan, a workload lookup by
+  `instance.id` for tagged instances it misses, and a workload lookup by `server.id` →
+  `workload.instance` as the last resort. The `metadataTag` query fallback for an
+  instance loaded without its tags is restored too.
+- The instance is resolved before anything is removed, while the server copy is still
+  present; then the instance tag is removed, then the server copy. An unresolved instance
+  logs a warning again.
+
+## [1.5.5] - 2026-09-30
+
+Release build for the 1.5 line (1.5.0–1.5.4 were internal builds; their entries below
+are the detail). Verified on Morpheus 9.0.2 from the 1.5.4 baseline.
+
+**`vmfolder` tag reconciliation is off by default.** Nothing reads a tag until an
+administrator sets `vmfolder tag mode` under Administration → Plugins → VM Folders.
+**`consume` mode is the plugin's first write to a Morpheus record:** after filing a VM
+it deletes the `vmfolder` tag from the instance and from the copy on its server, and
+nothing else. `keep` mode is read-only.
+
+### Added
+- **Folder chosen at provisioning time.** A tag `vmfolder` = `/prod/web`, entered in the
+  wizard under Configure → Advanced Options → Tags, through the API, or by Terraform,
+  files the VM under `/prod/web` on the next dashboard load and creates the folder if
+  needed. Works on VM Essentials, Advanced and Enterprise.
+- The tag name `vmfolders` is accepted as well as `vmfolder` (case-insensitive).
+
+### Changed
+- **The plugin settings form is the only place settings live.** Datastore scanning, tag
+  mode and both root labels are read from Administration → Plugins → VM Folders, which is
+  confirmed working on 9.0.2. The dashboard's ⚙ Settings dialog now only displays them.
+  The `POST /setConfig` and `POST /scanEnable` routes are removed, along with the
+  database fallback and the "form overrides the dialog" logic. Values an earlier 1.5 build
+  stored in the plugin database are ignored, so **re-enter any setting you changed in the
+  dashboard dialog in the plugin settings form.**
+- `consume` removes the instance's tag first, then the server copy; a tag is read from the
+  instance first, then the server. The `VmFolders tag consumed:` audit line names the
+  user, VM, path, and the result on each record.
+- The scanning checkbox is honoured whether the form stores it as `on` or `true`.
+
+### Removed
+- All `VmFolders tag/probe` logging and the remaining `TEMPORARY` diagnostics.
+- The workload-side instance lookups added in 1.5.3/1.5.4, on the belief that
+  `instance.list()` hydrates `containers`. **Wrong — reverted in 1.5.6.**
 
 ## [1.5.4] - 2026-09-30
 
@@ -52,7 +204,7 @@ already exists, so the cleanup takes a new number).
 ### Docs
 - README: how to set the tag (wizard, UI, API, Terraform), a table of accepted and
   rejected values, and a nine-step test sequence.
-- CLAUDE.md rule 6 now names reconcile-on-load in `vms()` as the single gated exception to
+- Project rule 6 now names reconcile-on-load in `vms()` as the single gated exception to
   "GET is read-only".
 
 ## [1.5.0] - 2026-09-30
@@ -373,7 +525,7 @@ net effect is described here.
 - `ComputeServer.managed` is the **agent** flag, not a managed-vs-discovered signal.
   Internal builds 1.3.0–1.3.2 keyed the badge off it, which mislabelled VMs and removed
   power controls from running instances; 1.3.3 reverted that and 1.3.4 replaced it with
-  the verified field. Recorded in `CLAUDE.md` so it is not repeated.
+  the verified field. Recorded in the project notes so it is not repeated.
 
 ## [1.2.0] - 2026-09-20
 

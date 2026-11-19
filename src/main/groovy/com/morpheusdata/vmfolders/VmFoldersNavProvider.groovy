@@ -10,6 +10,7 @@ import com.morpheusdata.views.ViewModel
 import groovy.util.logging.Slf4j
 
 /**
+ * VM Folders 1.5.10
  * Injects vmFolders.js into every Morpheus page via a nonced script tag.
  * The JS uses a MutationObserver to detect infrastructure pages and injects
  * a "Folder View" tab into Bootstrap's #nav-tabs-wrapper tab bar.
@@ -52,7 +53,10 @@ class VmFoldersNavProvider extends AbstractGlobalUIComponentProvider {
     HTMLResponse renderTemplate(User user, Account account) {
         try {
             ViewModel<Map> model = new ViewModel<>()
-            model.object = [:]
+            // 1.5.9: Morpheus serves plugin assets with Cache-Control max-age=31536000 and a
+            // constant ETag, so a browser keeps the previous build's vmFolders.js for a year.
+            // The version in the query string makes every build a new URL.
+            model.object = [assetVersion: VmFoldersController.VERSION]
             return getRenderer().renderTemplate('hbs/vmFoldersNav', model)
         } catch(e) {
             log.error("VmFoldersNavProvider.renderTemplate error: ${e.message}", e)
